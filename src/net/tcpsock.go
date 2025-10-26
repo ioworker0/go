@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// BUG(mikio): On JS and Windows, the File method of TCPConn and
+// BUG(mikio): On JS, the File method of TCPConn and
 // TCPListener is not implemented.
 
 // TCPAddr represents the address of a TCP end point.
@@ -126,6 +126,9 @@ type TCPConn struct {
 // By contrast, if only one of Idle and Interval is set to a non-negative value,
 // the other will be set to the system default value, and ultimately,
 // set both Idle and Interval to negative values if you want to leave them unchanged.
+//
+// Note that Solaris and its derivatives do not support setting Interval to a non-negative value
+// and Count to a negative value, or vice-versa.
 type KeepAliveConfig struct {
 	// If Enable is true, keep-alive probes are enabled.
 	Enable bool
@@ -241,8 +244,8 @@ func (c *TCPConn) SetKeepAlive(keepalive bool) error {
 // SetKeepAlivePeriod sets the duration the connection needs to
 // remain idle before TCP starts sending keepalive probes.
 //
-// Note that calling this method on Windows will reset the KeepAliveInterval
-// to the default system value, which is normally 1 second.
+// Note that calling this method on Windows prior to Windows 10 version 1709
+// will reset the KeepAliveInterval to the default system value, which is normally 1 second.
 func (c *TCPConn) SetKeepAlivePeriod(d time.Duration) error {
 	if !c.ok() {
 		return syscall.EINVAL
@@ -312,6 +315,10 @@ func newTCPConn(fd *netFD, keepAliveIdle time.Duration, keepAliveCfg KeepAliveCo
 // If the IP field of raddr is nil or an unspecified IP address, the
 // local system is assumed.
 func DialTCP(network string, laddr, raddr *TCPAddr) (*TCPConn, error) {
+	return dialTCP(context.Background(), nil, network, laddr, raddr)
+}
+
+func dialTCP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *TCPAddr) (*TCPConn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 	default:
@@ -321,7 +328,18 @@ func DialTCP(network string, laddr, raddr *TCPAddr) (*TCPConn, error) {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
 	sd := &sysDialer{network: network, address: raddr.String()}
-	c, err := sd.dialTCP(context.Background(), laddr, raddr)
+	var (
+		c   *TCPConn
+		err error
+	)
+	if dialer != nil {
+		sd.Dialer = *dialer
+	}
+	if sd.MultipathTCP() {
+		c, err = sd.dialMPTCP(ctx, laddr, raddr)
+	} else {
+		c, err = sd.dialTCP(ctx, laddr, raddr)
+	}
 	if err != nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: raddr.opAddr(), Err: err}
 	}
@@ -406,6 +424,9 @@ func (l *TCPListener) SetDeadline(t time.Time) error {
 // The returned os.File's file descriptor is different from the
 // connection's. Attempting to change properties of the original
 // using this duplicate may or may not have the desired effect.
+//
+// On Windows, the returned os.File's file descriptor is not
+// usable on other processes.
 func (l *TCPListener) File() (f *os.File, err error) {
 	if !l.ok() {
 		return nil, syscall.EINVAL
@@ -436,7 +457,15 @@ func ListenTCP(network string, laddr *TCPAddr) (*TCPListener, error) {
 		laddr = &TCPAddr{}
 	}
 	sl := &sysListener{network: network, address: laddr.String()}
-	ln, err := sl.listenTCP(context.Background(), laddr)
+	var (
+		ln  *TCPListener
+		err error
+	)
+	if sl.MultipathTCP() {
+		ln, err = sl.listenMPTCP(context.Background(), laddr)
+	} else {
+		ln, err = sl.listenTCP(context.Background(), laddr)
+	}
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: err}
 	}

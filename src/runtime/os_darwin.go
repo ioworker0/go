@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/stringslite"
 	"unsafe"
 )
 
@@ -14,6 +15,11 @@ type mOS struct {
 	mutex       pthreadmutex
 	cond        pthreadcond
 	count       int
+
+	// address of errno variable for this thread.
+	// This is an optimization to avoid calling libc_error
+	// on every syscall_rawsyscalln.
+	errnoAddr *int32
 }
 
 func unimplemented(name string) {
@@ -143,7 +149,7 @@ func osinit() {
 	// pthread_create delayed until end of goenvs so that we
 	// can look at the environment first.
 
-	ncpu = getncpu()
+	numCPUStartup = getCPUCount()
 	physPageSize = getPageSize()
 
 	osinit_hack()
@@ -167,7 +173,7 @@ const (
 	_HW_PAGESIZE = 7
 )
 
-func getncpu() int32 {
+func getCPUCount() int32 {
 	// Use sysctl to fetch hw.ncpu.
 	mib := [2]uint32{_CTL_HW, _HW_NCPU}
 	out := uint32(0)
@@ -191,14 +197,10 @@ func getPageSize() uintptr {
 	return 0
 }
 
-var urandom_dev = []byte("/dev/urandom\x00")
-
 //go:nosplit
 func readRandom(r []byte) int {
-	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
-	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
-	closefd(fd)
-	return int(n)
+	arc4random_buf(unsafe.Pointer(&r[0]), int32(len(r)))
+	return len(r)
 }
 
 func goenvs() {
@@ -333,6 +335,7 @@ func minit() {
 	}
 	minitSignalMask()
 	getg().m.procid = uint64(pthread_self())
+	libc_error_addr(&getg().m.errnoAddr)
 }
 
 // Called from dropm to undo the effect of an minit.
@@ -347,8 +350,12 @@ func unminit() {
 	getg().m.procid = 0
 }
 
-// Called from exitm, but not from drop, to undo the effect of thread-owned
+// Called from mexit, but not from dropm, to undo the effect of thread-owned
 // resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+//
+// This always runs without a P, so //go:nowritebarrierrec is required.
+//
+//go:nowritebarrierrec
 func mdestroy(mp *m) {
 }
 
@@ -465,10 +472,7 @@ func sysargs(argc int32, argv **byte) {
 	executablePath = gostringnocopy(argv_index(argv, n+1))
 
 	// strip "executable_path=" prefix if available, it's added after OS X 10.11.
-	const prefix = "executable_path="
-	if len(executablePath) > len(prefix) && executablePath[:len(prefix)] == prefix {
-		executablePath = executablePath[len(prefix):]
-	}
+	executablePath = stringslite.TrimPrefix(executablePath, "executable_path=")
 }
 
 func signalM(mp *m, sig int) {

@@ -20,16 +20,20 @@ import (
 	"cmd/internal/bio"
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
+	"cmd/internal/telemetry/counter"
 )
 
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("asm: ")
+	counter.Open()
 
 	buildcfg.Check()
 	GOARCH := buildcfg.GOARCH
 
 	flags.Parse()
+	counter.Inc("asm/invocations")
+	counter.CountFlags("asm/flag:", *flag.CommandLine)
 
 	architecture := arch.Set(GOARCH, *flags.Shared || *flags.Dynlink)
 	if architecture == nil {
@@ -45,6 +49,7 @@ func main() {
 	ctxt.Debugpcln = flags.DebugFlags.PCTab
 	ctxt.IsAsm = true
 	ctxt.Pkgpath = *flags.Importpath
+	ctxt.DwTextCount = objabi.DummyDwarfFunctionCountForAssembler()
 	switch *flags.Spectre {
 	default:
 		log.Printf("unknown setting -spectre=%s", *flags.Spectre)
@@ -53,7 +58,7 @@ func main() {
 		// nothing
 	case "index":
 		// known to compiler; ignore here so people can use
-		// the same list with -gcflags=-spectre=LIST and -asmflags=-spectrre=LIST
+		// the same list with -gcflags=-spectre=LIST and -asmflags=-spectre=LIST
 	case "all", "ret":
 		ctxt.Retpoline = true
 	}

@@ -9,7 +9,6 @@ import (
 	"debug/elf"
 	"debug/macho"
 	"debug/pe"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"go/format"
@@ -25,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -34,13 +34,13 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/gover"
-	"cmd/go/internal/robustio"
 	"cmd/go/internal/search"
 	"cmd/go/internal/toolchain"
 	"cmd/go/internal/vcs"
 	"cmd/go/internal/vcweb/vcstest"
-	"cmd/go/internal/web"
+	"cmd/go/internal/web/intercept"
 	"cmd/go/internal/work"
+	"cmd/internal/robustio"
 	"cmd/internal/sys"
 
 	cmdgo "cmd/go"
@@ -144,13 +144,13 @@ func TestMain(m *testing.M) {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "loading certificates from $TESTGO_VCSTEST_CERT: %v", err)
 			}
-			var interceptors []web.Interceptor
+			var interceptors []intercept.Interceptor
 			for _, host := range vcstest.Hosts {
 				interceptors = append(interceptors,
-					web.Interceptor{Scheme: "http", FromHost: host, ToHost: vcsTestHost},
-					web.Interceptor{Scheme: "https", FromHost: host, ToHost: vcsTestTLSHost, Client: vcsTestClient})
+					intercept.Interceptor{Scheme: "http", FromHost: host, ToHost: vcsTestHost},
+					intercept.Interceptor{Scheme: "https", FromHost: host, ToHost: vcsTestTLSHost, Client: vcsTestClient})
 			}
-			web.EnableTestHooks(interceptors)
+			intercept.EnableTestHooks(interceptors)
 		}
 
 		cmdgo.Main()
@@ -196,7 +196,7 @@ func TestMain(m *testing.M) {
 		defer removeAll(testTmpDir)
 	}
 
-	testGOCACHE = cache.DefaultDir()
+	testGOCACHE, _, _ = cache.DefaultDir()
 	if testenv.HasGoBuild() {
 		testBin = filepath.Join(testTmpDir, "testbin")
 		if err := os.Mkdir(testBin, 0777); err != nil {
@@ -468,12 +468,12 @@ func (tg *testgoData) unsetenv(name string) {
 		tg.env = append([]string(nil), os.Environ()...)
 		tg.env = append(tg.env, "GO111MODULE=off", "TESTGONETWORK=panic")
 		if testing.Short() {
-			tg.env = append(tg.env, "TESTGOVCS=panic")
+			tg.env = append(tg.env, "TESTGOVCSREMOTE=panic")
 		}
 	}
 	for i, v := range tg.env {
 		if strings.HasPrefix(v, name+"=") {
-			tg.env = append(tg.env[:i], tg.env[i+1:]...)
+			tg.env = slices.Delete(tg.env, i, i+1)
 			break
 		}
 	}
@@ -943,31 +943,31 @@ func TestNewReleaseRebuildsStalePackagesInGOPATH(t *testing.T) {
 	tg.run("install", "p1")
 	tg.wantNotStale("p1", "", "./testgo list claims p1 is stale, incorrectly, before any changes")
 
-	// Changing mtime of runtime/internal/sys/sys.go
+	// Changing mtime of internal/runtime/sys/sys.go
 	// should have no effect: only the content matters.
 	// In fact this should be true even outside a release branch.
-	sys := tg.path("goroot/src/runtime/internal/sys/sys.go")
+	sys := tg.path("goroot/src/internal/runtime/sys/sys.go")
 	tg.sleep()
 	restore := addVar(sys, 0)
 	restore()
-	tg.wantNotStale("p1", "", "./testgo list claims p1 is stale, incorrectly, after updating mtime of runtime/internal/sys/sys.go")
+	tg.wantNotStale("p1", "", "./testgo list claims p1 is stale, incorrectly, after updating mtime of internal/runtime/sys/sys.go")
 
 	// But changing content of any file should have an effect.
 	// Previously zversion.go was the only one that mattered;
 	// now they all matter, so keep using sys.go.
 	restore = addVar(sys, 1)
 	defer restore()
-	tg.wantStale("p1", "stale dependency: runtime/internal", "./testgo list claims p1 is NOT stale, incorrectly, after changing sys.go")
+	tg.wantStale("p1", "stale dependency: internal/runtime/sys", "./testgo list claims p1 is NOT stale, incorrectly, after changing sys.go")
 	restore()
 	tg.wantNotStale("p1", "", "./testgo list claims p1 is stale, incorrectly, after changing back to old release")
 	addVar(sys, 2)
-	tg.wantStale("p1", "stale dependency: runtime", "./testgo list claims p1 is NOT stale, incorrectly, after changing sys.go again")
+	tg.wantStale("p1", "stale dependency: internal/runtime/sys", "./testgo list claims p1 is NOT stale, incorrectly, after changing sys.go again")
 	tg.run("install", "p1")
 	tg.wantNotStale("p1", "", "./testgo list claims p1 is stale after building with new release")
 
 	// Restore to "old" release.
 	restore()
-	tg.wantStale("p1", "stale dependency: runtime/internal", "./testgo list claims p1 is NOT stale, incorrectly, after restoring sys.go")
+	tg.wantStale("p1", "not installed but available in build cache", "./testgo list claims p1 is NOT stale, incorrectly, after restoring sys.go")
 	tg.run("install", "p1")
 	tg.wantNotStale("p1", "", "./testgo list claims p1 is stale after building with old release")
 }
@@ -1058,7 +1058,7 @@ func TestGoListDeps(t *testing.T) {
 	if runtime.Compiler != "gccgo" {
 		// Check the list is in dependency order.
 		tg.run("list", "-deps", "math")
-		want := "internal/cpu\nunsafe\nmath/bits\nmath\n"
+		want := "unsafe\ninternal/cpu\nmath/bits\nmath\n"
 		out := tg.stdout.String()
 		if !strings.Contains(out, "internal/cpu") {
 			// Some systems don't use internal/cpu.
@@ -1078,24 +1078,24 @@ func TestGoListTest(t *testing.T) {
 	tg.makeTempdir()
 	tg.setenv("GOCACHE", tg.tempdir)
 
-	tg.run("list", "-test", "-deps", "sort")
-	tg.grepStdout(`^sort.test$`, "missing test main")
-	tg.grepStdout(`^sort$`, "missing real sort")
-	tg.grepStdout(`^sort \[sort.test\]$`, "missing test copy of sort")
-	tg.grepStdout(`^testing \[sort.test\]$`, "missing test copy of testing")
+	tg.run("list", "-test", "-deps", "bytes")
+	tg.grepStdout(`^bytes.test$`, "missing test main")
+	tg.grepStdout(`^bytes$`, "missing real bytes")
+	tg.grepStdout(`^bytes \[bytes.test\]$`, "missing test copy of bytes")
+	tg.grepStdout(`^testing \[bytes.test\]$`, "missing test copy of testing")
 	tg.grepStdoutNot(`^testing$`, "unexpected real copy of testing")
 
-	tg.run("list", "-test", "sort")
-	tg.grepStdout(`^sort.test$`, "missing test main")
-	tg.grepStdout(`^sort$`, "missing real sort")
-	tg.grepStdout(`^sort \[sort.test\]$`, "unexpected test copy of sort")
-	tg.grepStdoutNot(`^testing \[sort.test\]$`, "unexpected test copy of testing")
+	tg.run("list", "-test", "bytes")
+	tg.grepStdout(`^bytes.test$`, "missing test main")
+	tg.grepStdout(`^bytes$`, "missing real bytes")
+	tg.grepStdout(`^bytes \[bytes.test\]$`, "unexpected test copy of bytes")
+	tg.grepStdoutNot(`^testing \[bytes.test\]$`, "unexpected test copy of testing")
 	tg.grepStdoutNot(`^testing$`, "unexpected real copy of testing")
 
-	tg.run("list", "-test", "cmd/buildid", "cmd/doc")
+	tg.run("list", "-test", "cmd/buildid", "cmd/gofmt")
 	tg.grepStdout(`^cmd/buildid$`, "missing cmd/buildid")
-	tg.grepStdout(`^cmd/doc$`, "missing cmd/doc")
-	tg.grepStdout(`^cmd/doc\.test$`, "missing cmd/doc test")
+	tg.grepStdout(`^cmd/gofmt$`, "missing cmd/gofmt")
+	tg.grepStdout(`^cmd/gofmt\.test$`, "missing cmd/gofmt test")
 	tg.grepStdoutNot(`^cmd/buildid\.test$`, "unexpected cmd/buildid test")
 	tg.grepStdoutNot(`^testing`, "unexpected testing")
 
@@ -1146,6 +1146,8 @@ func TestGoListCompiledCgo(t *testing.T) {
 }
 
 func TestGoListExport(t *testing.T) {
+	tooSlow(t, "runs build for -export")
+
 	skipIfGccgo(t, "gccgo does not have standard packages")
 	tg := testgo(t)
 	defer tg.cleanup()
@@ -1504,13 +1506,16 @@ func main() {
 	tg.setenv("PKG_CONFIG_PATH", tg.path("."))
 	tg.run("run", tg.path("foo.go"))
 
-	// test for ldflags
-	tg.tempFile("bar.pc", `
+	if runtime.GOOS != "darwin" { // darwin doesn't like these ldflags
+		// test for ldflags
+		tg.tempFile("bar.pc", `
 Name: bar
 Description: The bar library
 Version: 1.0.0
 Libs: -Wl,-rpath=/path\ with\ spaces/bin
 `)
+	}
+
 	tg.tempFile("bar.go", `package main
 /*
 #cgo pkg-config: bar
@@ -2124,38 +2129,6 @@ func testBuildmodePIE(t *testing.T, useCgo, setBuildmodeToPIE bool) {
 		}
 		if (dc & pe.IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) == 0 {
 			t.Error("IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE flag is not set")
-		}
-		if useCgo {
-			// Test that only one symbol is exported (#40795).
-			// PIE binaries don´t require .edata section but unfortunately
-			// binutils doesn´t generate a .reloc section unless there is
-			// at least one symbol exported.
-			// See https://sourceware.org/bugzilla/show_bug.cgi?id=19011
-			section := f.Section(".edata")
-			if section == nil {
-				t.Skip(".edata section is not present")
-			}
-			// TODO: deduplicate this struct from cmd/link/internal/ld/pe.go
-			type IMAGE_EXPORT_DIRECTORY struct {
-				_                 [2]uint32
-				_                 [2]uint16
-				_                 [2]uint32
-				NumberOfFunctions uint32
-				NumberOfNames     uint32
-				_                 [3]uint32
-			}
-			var e IMAGE_EXPORT_DIRECTORY
-			if err := binary.Read(section.Open(), binary.LittleEndian, &e); err != nil {
-				t.Fatalf("binary.Read failed: %v", err)
-			}
-
-			// Only _cgo_dummy_export should be exported
-			if e.NumberOfFunctions != 1 {
-				t.Fatalf("got %d exported functions; want 1", e.NumberOfFunctions)
-			}
-			if e.NumberOfNames != 1 {
-				t.Fatalf("got %d exported names; want 1", e.NumberOfNames)
-			}
 		}
 	default:
 		// testBuildmodePIE opens object files, so it needs to understand the object
@@ -2790,11 +2763,8 @@ func TestExecInDeletedDir(t *testing.T) {
 	tg := testgo(t)
 	defer tg.cleanup()
 
-	wd, err := os.Getwd()
-	tg.check(err)
 	tg.makeTempdir()
-	tg.check(os.Chdir(tg.tempdir))
-	defer func() { tg.check(os.Chdir(wd)) }()
+	t.Chdir(tg.tempdir)
 
 	tg.check(os.Remove(tg.tempdir))
 

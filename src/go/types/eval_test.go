@@ -9,10 +9,10 @@ package types_test
 import (
 	"fmt"
 	"go/ast"
-	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"internal/godebug"
 	"internal/testenv"
 	"strings"
 	"testing"
@@ -173,10 +173,21 @@ func TestEvalPos(t *testing.T) {
 		if err != nil {
 			t.Fatalf("could not parse file %d: %s", i, err)
 		}
+
+		// Materialized aliases give a different (better)
+		// result for the final test, so skip it for now.
+		// TODO(adonovan): reenable when gotypesalias=1 is the default.
+		switch gotypesalias.Value() {
+		case "", "1":
+			if strings.Contains(src, "interface{R}.Read") {
+				continue
+			}
+		}
+
 		files = append(files, file)
 	}
 
-	conf := Config{Importer: importer.Default()}
+	conf := Config{Importer: defaultImporter(fset)}
 	pkg, err := conf.Check("p", fset, files, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -195,6 +206,9 @@ func TestEvalPos(t *testing.T) {
 		}
 	}
 }
+
+// gotypesalias controls the use of Alias types.
+var gotypesalias = godebug.New("gotypesalias")
 
 // split splits string s at the first occurrence of s, trimming spaces.
 func split(s, sep string) (string, string) {
@@ -242,7 +256,7 @@ func f(a int, s string) S {
 		t.Fatal(err)
 	}
 
-	conf := Config{Importer: importer.Default()}
+	conf := Config{Importer: defaultImporter(fset)}
 	pkg, err := conf.Check("p", fset, []*ast.File{f}, nil)
 	if err != nil {
 		t.Fatal(err)

@@ -31,12 +31,12 @@ func TestSizeof(t *testing.T) {
 		{Interface{}, 40, 80},
 		{Map{}, 16, 32},
 		{Chan{}, 12, 24},
-		{Named{}, 60, 112},
+		{Named{}, 64, 120},
 		{TypeParam{}, 28, 48},
 		{term{}, 12, 24},
 
 		// Objects
-		{PkgName{}, 64, 104},
+		{PkgName{}, 60, 96},
 		{Const{}, 64, 104},
 		{TypeName{}, 56, 88},
 		{Var{}, 64, 104},

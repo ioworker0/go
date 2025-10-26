@@ -10,8 +10,9 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
-	"cmd/go/internal/par"
 	"cmd/go/internal/str"
+	"cmd/internal/par"
+	"cmd/internal/pathcache"
 	"errors"
 	"fmt"
 	"internal/lazyregexp"
@@ -42,7 +43,7 @@ type shellShared struct {
 	workDir string // $WORK, immutable
 
 	printLock sync.Mutex
-	printFunc func(args ...any) (int, error)
+	printer   load.Printer
 	scriptDir string // current directory in printed script
 
 	mkdirCache par.Cache[string, error] // a cache of created directories
@@ -50,31 +51,43 @@ type shellShared struct {
 
 // NewShell returns a new Shell.
 //
-// Shell will internally serialize calls to the print function.
-// If print is nil, it defaults to printing to stderr.
-func NewShell(workDir string, print func(a ...any) (int, error)) *Shell {
-	if print == nil {
-		print = func(a ...any) (int, error) {
-			return fmt.Fprint(os.Stderr, a...)
-		}
+// Shell will internally serialize calls to the printer.
+// If printer is nil, it uses load.DefaultPrinter.
+func NewShell(workDir string, printer load.Printer) *Shell {
+	if printer == nil {
+		printer = load.DefaultPrinter()
 	}
 	shared := &shellShared{
-		workDir:   workDir,
-		printFunc: print,
+		workDir: workDir,
+		printer: printer,
 	}
 	return &Shell{shellShared: shared}
 }
 
-// Print emits a to this Shell's output stream, formatting it like fmt.Print.
-// It is safe to call concurrently.
-func (sh *Shell) Print(a ...any) {
-	sh.printLock.Lock()
-	defer sh.printLock.Unlock()
-	sh.printFunc(a...)
+func (sh *Shell) pkg() *load.Package {
+	if sh.action == nil {
+		return nil
+	}
+	return sh.action.Package
 }
 
-func (sh *Shell) printLocked(a ...any) {
-	sh.printFunc(a...)
+// Printf emits a to this Shell's output stream, formatting it like fmt.Printf.
+// It is safe to call concurrently.
+func (sh *Shell) Printf(format string, a ...any) {
+	sh.printLock.Lock()
+	defer sh.printLock.Unlock()
+	sh.printer.Printf(sh.pkg(), format, a...)
+}
+
+func (sh *Shell) printfLocked(format string, a ...any) {
+	sh.printer.Printf(sh.pkg(), format, a...)
+}
+
+// Errorf reports an error on sh's package and sets the process exit status to 1.
+func (sh *Shell) Errorf(format string, a ...any) {
+	sh.printLock.Lock()
+	defer sh.printLock.Unlock()
+	sh.printer.Errorf(sh.pkg(), format, a...)
 }
 
 // WithAction returns a Shell identical to sh, but bound to Action a.
@@ -110,11 +123,17 @@ func (sh *Shell) moveOrCopyFile(dst, src string, perm fs.FileMode, force bool) e
 		return nil
 	}
 
+	err := checkDstOverwrite(dst, force)
+	if err != nil {
+		return err
+	}
+
 	// If we can update the mode and rename to the dst, do it.
 	// Otherwise fall back to standard copy.
 
 	// If the source is in the build cache, we need to copy it.
-	if strings.HasPrefix(src, cache.DefaultDir()) {
+	dir, _, _ := cache.DefaultDir()
+	if strings.HasPrefix(src, dir) {
 		return sh.CopyFile(dst, src, perm, force)
 	}
 
@@ -164,7 +183,7 @@ func (sh *Shell) moveOrCopyFile(dst, src string, perm fs.FileMode, force bool) e
 	return sh.CopyFile(dst, src, perm, force)
 }
 
-// copyFile is like 'cp src dst'.
+// CopyFile is like 'cp src dst'.
 func (sh *Shell) CopyFile(dst, src string, perm fs.FileMode, force bool) error {
 	if cfg.BuildN || cfg.BuildX {
 		sh.ShowCmd("", "cp %s %s", src, dst)
@@ -179,16 +198,9 @@ func (sh *Shell) CopyFile(dst, src string, perm fs.FileMode, force bool) error {
 	}
 	defer sf.Close()
 
-	// Be careful about removing/overwriting dst.
-	// Do not remove/overwrite if dst exists and is a directory
-	// or a non-empty non-object file.
-	if fi, err := os.Stat(dst); err == nil {
-		if fi.IsDir() {
-			return fmt.Errorf("build output %q already exists and is a directory", dst)
-		}
-		if !force && fi.Mode().IsRegular() && fi.Size() != 0 && !isObject(dst) {
-			return fmt.Errorf("build output %q already exists and is not an object file", dst)
-		}
+	err = checkDstOverwrite(dst, force)
+	if err != nil {
+		return err
 	}
 
 	// On Windows, remove lingering ~ file from last attempt.
@@ -231,6 +243,21 @@ func mayberemovefile(s string) {
 		return
 	}
 	os.Remove(s)
+}
+
+// Be careful about removing/overwriting dst.
+// Do not remove/overwrite if dst exists and is a directory
+// or a non-empty non-object file.
+func checkDstOverwrite(dst string, force bool) error {
+	if fi, err := os.Stat(dst); err == nil {
+		if fi.IsDir() {
+			return fmt.Errorf("build output %q already exists and is a directory", dst)
+		}
+		if !force && fi.Mode().IsRegular() && fi.Size() != 0 && !isObject(dst) {
+			return fmt.Errorf("build output %q already exists and is not an object file", dst)
+		}
+	}
+	return nil
 }
 
 // writeFile writes the text to file.
@@ -357,7 +384,7 @@ func (sh *Shell) ShowCmd(dir string, format string, args ...any) {
 	if dir != "" && dir != "/" {
 		if dir != sh.scriptDir {
 			// Show changing to dir and update the current directory.
-			sh.printLocked(sh.fmtCmd("", "cd %s\n", dir))
+			sh.printfLocked("%s", sh.fmtCmd("", "cd %s\n", dir))
 			sh.scriptDir = dir
 		}
 		// Replace scriptDir is our working directory. Replace it
@@ -369,7 +396,7 @@ func (sh *Shell) ShowCmd(dir string, format string, args ...any) {
 		cmd = strings.ReplaceAll(" "+cmd, " "+dir, dot)[1:]
 	}
 
-	sh.printLocked(cmd + "\n")
+	sh.printfLocked("%s\n", cmd)
 }
 
 // reportCmd reports the output and exit status of a command. The cmdOut and
@@ -508,7 +535,7 @@ func (sh *Shell) reportCmd(desc, dir string, cmdOut []byte, cmdErr error) error 
 		a.output = append(a.output, err.Error()...)
 	} else {
 		// Write directly to the Builder output.
-		sh.Print(err.Error())
+		sh.Printf("%s", err)
 	}
 	return nil
 }
@@ -605,7 +632,7 @@ func (sh *Shell) runOut(dir string, env []string, cmdargs ...any) ([]byte, error
 	}
 
 	var buf bytes.Buffer
-	path, err := cfg.LookPath(cmdline[0])
+	path, err := pathcache.LookPath(cmdline[0])
 	if err != nil {
 		return nil, err
 	}

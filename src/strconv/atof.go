@@ -18,10 +18,7 @@ var optimize = true // set to false to force slow-path conversions for testing
 // prefix of s and prefix, with the character case of s ignored.
 // The prefix argument must be all lower-case.
 func commonPrefixLenIgnoreCase(s, prefix string) int {
-	n := len(prefix)
-	if n > len(s) {
-		n = len(s)
-	}
+	n := min(len(prefix), len(s))
 	for i := 0; i < n; i++ {
 		c := s[i]
 		if 'A' <= c && c <= 'Z' {
@@ -80,12 +77,12 @@ func (b *decimal) set(s string) (ok bool) {
 	if i >= len(s) {
 		return
 	}
-	switch {
-	case s[i] == '+':
+	switch s[i] {
+	case '+':
 		i++
-	case s[i] == '-':
+	case '-':
+		i++
 		b.neg = true
-		i++
 	}
 
 	// digits
@@ -138,9 +135,10 @@ func (b *decimal) set(s string) (ok bool) {
 			return
 		}
 		esign := 1
-		if s[i] == '+' {
+		switch s[i] {
+		case '+':
 			i++
-		} else if s[i] == '-' {
+		case '-':
 			i++
 			esign = -1
 		}
@@ -179,12 +177,12 @@ func readFloat(s string) (mantissa uint64, exp int, neg, trunc, hex bool, i int,
 	if i >= len(s) {
 		return
 	}
-	switch {
-	case s[i] == '+':
+	switch s[i] {
+	case '+':
 		i++
-	case s[i] == '-':
+	case '-':
+		i++
 		neg = true
-		i++
 	}
 
 	// digits
@@ -271,9 +269,10 @@ loop:
 			return
 		}
 		esign := 1
-		if s[i] == '+' {
+		switch s[i] {
+		case '+':
 			i++
-		} else if s[i] == '-' {
+		case '-':
 			i++
 			esign = -1
 		}
@@ -461,7 +460,7 @@ func atof64exact(mantissa uint64, exp int, neg bool) (f float64, ok bool) {
 // If possible to compute mantissa*10^exp to 32-bit float f exactly,
 // entirely in floating-point math, do so, avoiding the machinery above.
 func atof32exact(mantissa uint64, exp int, neg bool) (f float32, ok bool) {
-	if mantissa>>float32info.mantbits != 0 {
+	if mantissa>>float32MantBits != 0 {
 		return
 	}
 	f = float32(mantissa)

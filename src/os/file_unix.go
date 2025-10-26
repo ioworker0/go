@@ -11,6 +11,7 @@ import (
 	"internal/syscall/unix"
 	"io/fs"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	_ "unsafe" // for go:linkname
 )
@@ -58,25 +59,14 @@ func rename(oldname, newname string) error {
 type file struct {
 	pfd         poll.FD
 	name        string
-	dirinfo     *dirInfo // nil unless directory being read
-	nonblock    bool     // whether we set nonblocking mode
-	stdoutOrErr bool     // whether this is stdout or stderr
-	appendMode  bool     // whether file is opened for appending
+	dirinfo     atomic.Pointer[dirInfo] // nil unless directory being read
+	nonblock    bool                    // whether we set nonblocking mode
+	stdoutOrErr bool                    // whether this is stdout or stderr
+	appendMode  bool                    // whether file is opened for appending
 }
 
-// Fd returns the integer Unix file descriptor referencing the open file.
-// If f is closed, the file descriptor becomes invalid.
-// If f is garbage collected, a finalizer may close the file descriptor,
-// making it invalid; see [runtime.SetFinalizer] for more information on when
-// a finalizer might be run. On Unix systems this will cause the [File.SetDeadline]
-// methods to stop working.
-// Because file descriptors can be reused, the returned file descriptor may
-// only be closed through the [File.Close] method of f, or by its finalizer during
-// garbage collection. Otherwise, during garbage collection the finalizer
-// may close an unrelated file descriptor with the same (reused) number.
-//
-// As an alternative, see the f.SyscallConn method.
-func (f *File) Fd() uintptr {
+// fd is the Unix implementation of Fd.
+func (f *File) fd() uintptr {
 	if f == nil {
 		return ^(uintptr(0))
 	}
@@ -93,16 +83,8 @@ func (f *File) Fd() uintptr {
 	return uintptr(f.pfd.Sysfd)
 }
 
-// NewFile returns a new File with the given file descriptor and
-// name. The returned value will be nil if fd is not a valid file
-// descriptor. On Unix systems, if the file descriptor is in
-// non-blocking mode, NewFile will attempt to return a pollable File
-// (one for which the SetDeadline methods work).
-//
-// After passing it to NewFile, fd may become invalid under the same
-// conditions described in the comments of the Fd method, and the same
-// constraints apply.
-func NewFile(fd uintptr, name string) *File {
+// newFileFromNewFile is called by [NewFile].
+func newFileFromNewFile(fd uintptr, name string) *File {
 	fdi := int(fd)
 	if fdi < 0 {
 		return nil
@@ -151,7 +133,7 @@ const (
 	kindSock
 	// kindNoPoll means that we should not put the descriptor into
 	// non-blocking mode, because we know it is not a pipe or FIFO.
-	// Used by openFdAt and openDirNolog for directories.
+	// Used by openDirAt and openDirNolog for directories.
 	kindNoPoll
 )
 
@@ -259,7 +241,7 @@ func epipecheck(file *File, e error) {
 const DevNull = "/dev/null"
 
 // openFileNolog is the Unix implementation of OpenFile.
-// Changes here should be reflected in openFdAt and openDirNolog, if relevant.
+// Changes here should be reflected in openDirAt and openDirNolog, if relevant.
 func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	setSticky := false
 	if !supportsCreateWithStickyBit && flag&O_CREATE != 0 && perm&ModeSticky != 0 {
@@ -305,7 +287,7 @@ func openDirNolog(name string) (*File, error) {
 		e error
 	)
 	ignoringEINTR(func() error {
-		r, s, e = open(name, O_RDONLY|syscall.O_CLOEXEC, 0)
+		r, s, e = open(name, O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY, 0)
 		return e
 	})
 	if e != nil {
@@ -325,9 +307,8 @@ func (file *file) close() error {
 	if file == nil {
 		return syscall.EINVAL
 	}
-	if file.dirinfo != nil {
-		file.dirinfo.close()
-		file.dirinfo = nil
+	if info := file.dirinfo.Swap(nil); info != nil {
+		info.close()
 	}
 	var err error
 	if e := file.pfd.Close(); e != nil {
@@ -347,11 +328,10 @@ func (file *file) close() error {
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 func (f *File) seek(offset int64, whence int) (ret int64, err error) {
-	if f.dirinfo != nil {
+	if info := f.dirinfo.Swap(nil); info != nil {
 		// Free cached dirinfo, so we allocate a new one if we
 		// access this file as a directory again. See #35767 and #37161.
-		f.dirinfo.close()
-		f.dirinfo = nil
+		info.close()
 	}
 	ret, err = f.pfd.Seek(offset, whence)
 	runtime.KeepAlive(f)
@@ -360,7 +340,7 @@ func (f *File) seek(offset int64, whence int) (ret int64, err error) {
 
 // Truncate changes the size of the named file.
 // If the file is a symbolic link, it changes the size of the link's target.
-// If there is an error, it will be of type *PathError.
+// If there is an error, it will be of type [*PathError].
 func Truncate(name string, size int64) error {
 	e := ignoringEINTR(func() error {
 		return syscall.Truncate(name, size)
@@ -372,7 +352,7 @@ func Truncate(name string, size int64) error {
 }
 
 // Remove removes the named file or (empty) directory.
-// If there is an error, it will be of type *PathError.
+// If there is an error, it will be of type [*PathError].
 func Remove(name string) error {
 	// System call interface forces us to know
 	// whether name is a file or directory.
@@ -447,22 +427,15 @@ func Symlink(oldname, newname string) error {
 func readlink(name string) (string, error) {
 	for len := 128; ; len *= 2 {
 		b := make([]byte, len)
-		var (
-			n int
-			e error
-		)
-		for {
-			n, e = fixCount(syscall.Readlink(name, b))
-			if e != syscall.EINTR {
-				break
-			}
-		}
+		n, err := ignoringEINTR2(func() (int, error) {
+			return fixCount(syscall.Readlink(name, b))
+		})
 		// buffer too small
-		if (runtime.GOOS == "aix" || runtime.GOOS == "wasip1") && e == syscall.ERANGE {
+		if (runtime.GOOS == "aix" || runtime.GOOS == "wasip1") && err == syscall.ERANGE {
 			continue
 		}
-		if e != nil {
-			return "", &PathError{Op: "readlink", Path: name, Err: e}
+		if err != nil {
+			return "", &PathError{Op: "readlink", Path: name, Err: err}
 		}
 		if n < len {
 			return string(b[0:n]), nil
@@ -498,7 +471,7 @@ func newUnixDirent(parent, name string, typ FileMode) (DirEntry, error) {
 		name:   name,
 		typ:    typ,
 	}
-	if typ != ^FileMode(0) && !testingForceReadDirLstat {
+	if typ != ^FileMode(0) {
 		return ude, nil
 	}
 

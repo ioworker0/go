@@ -7,6 +7,7 @@ package walk
 import (
 	"fmt"
 	"go/constant"
+	"internal/abi"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
@@ -219,8 +220,14 @@ func (o *orderState) safeExpr(n ir.Node) ir.Node {
 //
 //	n.Left = o.addrTemp(n.Left)
 func (o *orderState) addrTemp(n ir.Node) ir.Node {
-	if n.Op() == ir.OLITERAL || n.Op() == ir.ONIL {
-		// TODO: expand this to all static composite literal nodes?
+	// Note: Avoid addrTemp with static assignment for literal strings
+	// when compiling FIPS packages.
+	// The problem is that panic("foo") ends up creating a static RODATA temp
+	// for the implicit conversion of "foo" to any, and we can't handle
+	// the relocations in that temp.
+	if n.Op() == ir.ONIL || (n.Op() == ir.OLITERAL && !base.Ctxt.IsFIPS()) {
+		// This is a basic literal or nil that we can store
+		// directly in the read-only data section.
 		n = typecheck.DefaultLit(n, nil)
 		types.CalcSize(n.Type())
 		vstat := readonlystaticname(n.Type())
@@ -231,6 +238,32 @@ func (o *orderState) addrTemp(n ir.Node) ir.Node {
 		}
 		vstat = typecheck.Expr(vstat).(*ir.Name)
 		return vstat
+	}
+
+	// Check now for a composite literal to possibly store in the read-only data section.
+	v := staticValue(n)
+	if v == nil {
+		v = n
+	}
+	optEnabled := func(n ir.Node) bool {
+		// Do this optimization only when enabled for this node.
+		return base.LiteralAllocHash.MatchPos(n.Pos(), nil)
+	}
+	if (v.Op() == ir.OSTRUCTLIT || v.Op() == ir.OARRAYLIT) && !base.Ctxt.IsFIPS() {
+		if ir.IsZero(v) && 0 < v.Type().Size() && v.Type().Size() <= abi.ZeroValSize && optEnabled(n) {
+			// This zero value can be represented by the read-only zeroVal.
+			zeroVal := ir.NewLinksymExpr(v.Pos(), ir.Syms.ZeroVal, n.Type())
+			vstat := typecheck.Expr(zeroVal).(*ir.LinksymOffsetExpr)
+			return vstat
+		}
+		if isStaticCompositeLiteral(v) && optEnabled(n) {
+			// v can be directly represented in the read-only data section.
+			lit := v.(*ir.CompLitExpr)
+			vstat := readonlystaticname(n.Type())
+			fixedlit(inInitFunction, initKindStatic, lit, vstat, nil) // nil init
+			vstat = typecheck.Expr(vstat).(*ir.Name)
+			return vstat
+		}
 	}
 
 	// Prevent taking the address of an SSA-able local variable (#63332).
@@ -328,6 +361,14 @@ func (o *orderState) mapKeyTemp(outerPos src.XPos, t *types.Type, n ir.Node) ir.
 // It would be nice to handle these generally, but because
 // []byte keys are not allowed in maps, the use of string(k)
 // comes up in important cases in practice. See issue 3512.
+//
+// Note that this code does not handle the case:
+//
+//	s := string(k)
+//	x = m[s]
+//
+// Cases like this are handled during SSA, search for slicebytetostring
+// in ../ssa/_gen/generic.rules.
 func mapKeyReplaceStrConv(n ir.Node) bool {
 	var replaced bool
 	switch n.Op() {
@@ -447,7 +488,7 @@ func (o *orderState) edge() {
 	// never 0.
 	// Another policy presented in the paper is the Saturated Counters policy which
 	// freezes the counter when it reaches the value of 255. However, a range
-	// of experiments showed that that decreases overall performance.
+	// of experiments showed that doing so decreases overall performance.
 	o.append(ir.NewIfStmt(base.Pos,
 		ir.NewBinaryExpr(base.Pos, ir.OEQ, counter, ir.NewInt(base.Pos, 0xff)),
 		[]ir.Node{ir.NewAssignStmt(base.Pos, counter, ir.NewInt(base.Pos, 1))},
@@ -804,7 +845,7 @@ func (o *orderState) stmt(n ir.Node) {
 		o.out = append(o.out, n)
 		o.popTemp(t)
 
-	case ir.OPRINT, ir.OPRINTLN, ir.ORECOVERFP:
+	case ir.OPRINT, ir.OPRINTLN, ir.ORECOVER:
 		n := n.(*ir.CallExpr)
 		t := o.markTemp()
 		o.call(n)
@@ -1209,7 +1250,7 @@ func (o *orderState) expr1(n, lhs ir.Node) ir.Node {
 			}
 		}
 
-		// key may need to be be addressable
+		// key may need to be addressable
 		n.Index = o.mapKeyTemp(n.Pos(), n.X.Type(), n.Index)
 		if needCopy {
 			return o.copyExpr(n)
@@ -1309,7 +1350,7 @@ func (o *orderState) expr1(n, lhs ir.Node) ir.Node {
 		ir.OMIN,
 		ir.ONEW,
 		ir.OREAL,
-		ir.ORECOVERFP,
+		ir.ORECOVER,
 		ir.OSTR2BYTES,
 		ir.OSTR2BYTESTMP,
 		ir.OSTR2RUNES:

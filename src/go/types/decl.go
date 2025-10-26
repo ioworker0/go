@@ -10,6 +10,7 @@ import (
 	"go/constant"
 	"go/token"
 	. "internal/types/errors"
+	"slices"
 )
 
 func (check *Checker) declare(scope *Scope, id *ast.Ident, obj Object, pos token.Pos) {
@@ -47,6 +48,17 @@ func pathString(path []Object) string {
 // objDecl type-checks the declaration of obj in its respective (file) environment.
 // For the meaning of def, see Checker.definedType, in typexpr.go.
 func (check *Checker) objDecl(obj Object, def *TypeName) {
+	if tracePos {
+		check.pushPos(atPos(obj.Pos()))
+		defer func() {
+			// If we're panicking, keep stack of source positions.
+			if p := recover(); p != nil {
+				panic(p)
+			}
+			check.popPos()
+		}()
+	}
+
 	if check.conf._Trace && obj.Type() == nil {
 		if check.indent == 0 {
 			fmt.Println() // empty line between top-level objects for readability
@@ -169,9 +181,7 @@ func (check *Checker) objDecl(obj Object, def *TypeName) {
 	defer func(env environment) {
 		check.environment = env
 	}(check.environment)
-	check.environment = environment{
-		scope: d.file,
-	}
+	check.environment = environment{scope: d.file, version: d.version}
 
 	// Const and var declarations must not have initialization
 	// cycles. We track them by remembering the current declaration
@@ -216,8 +226,8 @@ func (check *Checker) validCycle(obj Object) (valid bool) {
 	start := obj.color() - grey // index of obj in objPath
 	cycle := check.objPath[start:]
 	tparCycle := false // if set, the cycle is through a type parameter list
-	nval := 0          // number of (constant or variable) values in the cycle; valid if !generic
-	ndef := 0          // number of type definitions in the cycle; valid if !generic
+	nval := 0          // number of (constant or variable) values in the cycle
+	ndef := 0          // number of type definitions in the cycle
 loop:
 	for _, obj := range cycle {
 		switch obj := obj.(type) {
@@ -226,7 +236,7 @@ loop:
 		case *TypeName:
 			// If we reach a generic type that is part of a cycle
 			// and we are in a type parameter list, we have a cycle
-			// through a type parameter list, which is invalid.
+			// through a type parameter list.
 			if check.inTParamList && isGeneric(obj.typ) {
 				tparCycle = true
 				break loop
@@ -242,7 +252,7 @@ loop:
 			// the syntactic information. We should consider storing
 			// this information explicitly in the object.
 			var alias bool
-			if check.enableAlias {
+			if check.conf._EnableAlias {
 				alias = obj.IsAlias()
 			} else {
 				if d := check.objMap[obj]; d != nil {
@@ -277,20 +287,23 @@ loop:
 		}()
 	}
 
-	if !tparCycle {
-		// A cycle involving only constants and variables is invalid but we
-		// ignore them here because they are reported via the initialization
-		// cycle check.
-		if nval == len(cycle) {
-			return true
-		}
+	// Cycles through type parameter lists are ok (go.dev/issue/68162).
+	if tparCycle {
+		return true
+	}
 
-		// A cycle involving only types (and possibly functions) must have at least
-		// one type definition to be permitted: If there is no type definition, we
-		// have a sequence of alias type names which will expand ad infinitum.
-		if nval == 0 && ndef > 0 {
-			return true
-		}
+	// A cycle involving only constants and variables is invalid but we
+	// ignore them here because they are reported via the initialization
+	// cycle check.
+	if nval == len(cycle) {
+		return true
+	}
+
+	// A cycle involving only types (and possibly functions) must have at least
+	// one type definition to be permitted: If there is no type definition, we
+	// have a sequence of alias type names which will expand ad infinitum.
+	if nval == 0 && ndef > 0 {
+		return true
 	}
 
 	check.cycleError(cycle, firstInSrc(cycle))
@@ -302,50 +315,48 @@ func (check *Checker) cycleError(cycle []Object, start int) {
 	// name returns the (possibly qualified) object name.
 	// This is needed because with generic types, cycles
 	// may refer to imported types. See go.dev/issue/50788.
-	// TODO(gri) Thus functionality is used elsewhere. Factor it out.
+	// TODO(gri) This functionality is used elsewhere. Factor it out.
 	name := func(obj Object) string {
 		return packagePrefix(obj.Pkg(), check.qualifier) + obj.Name()
 	}
 
-	obj := cycle[start]
-	objName := name(obj)
 	// If obj is a type alias, mark it as valid (not broken) in order to avoid follow-on errors.
+	obj := cycle[start]
 	tname, _ := obj.(*TypeName)
-	if tname != nil && tname.IsAlias() {
-		// If we use Alias nodes, it is initialized with Typ[Invalid].
-		// TODO(gri) Adjust this code if we initialize with nil.
-		if !check.enableAlias {
-			check.validAlias(tname, Typ[Invalid])
+	if tname != nil {
+		if check.conf._EnableAlias {
+			if a, ok := tname.Type().(*Alias); ok {
+				a.fromRHS = Typ[Invalid]
+			}
+		} else {
+			if tname.IsAlias() {
+				check.validAlias(tname, Typ[Invalid])
+			}
 		}
 	}
 
 	// report a more concise error for self references
 	if len(cycle) == 1 {
 		if tname != nil {
-			check.errorf(obj, InvalidDeclCycle, "invalid recursive type: %s refers to itself", objName)
+			check.errorf(obj, InvalidDeclCycle, "invalid recursive type: %s refers to itself", name(obj))
 		} else {
-			check.errorf(obj, InvalidDeclCycle, "invalid cycle in declaration: %s refers to itself", objName)
+			check.errorf(obj, InvalidDeclCycle, "invalid cycle in declaration: %s refers to itself", name(obj))
 		}
 		return
 	}
 
 	err := check.newError(InvalidDeclCycle)
 	if tname != nil {
-		err.addf(obj, "invalid recursive type %s", objName)
+		err.addf(obj, "invalid recursive type %s", name(obj))
 	} else {
-		err.addf(obj, "invalid cycle in declaration of %s", objName)
+		err.addf(obj, "invalid cycle in declaration of %s", name(obj))
 	}
-	i := start
-	for range cycle {
-		err.addf(obj, "%s refers to", objName)
-		i++
-		if i >= len(cycle) {
-			i = 0
-		}
-		obj = cycle[i]
-		objName = name(obj)
+	// "cycle[i] refers to cycle[j]" for (i,j) = (s,s+1), (s+1,s+2), ..., (n-1,0), (0,1), ..., (s-1,s) for len(cycle) = n, s = start.
+	for i := range cycle {
+		next := cycle[(start+i+1)%len(cycle)]
+		err.addf(obj, "%s refers to %s", name(obj), name(next))
+		obj = next
 	}
-	err.addf(obj, "%s", objName)
 	err.report()
 }
 
@@ -455,7 +466,7 @@ func (check *Checker) constDecl(obj *Const, typ, init ast.Expr, inherited bool) 
 		if !isConstType(t) {
 			// don't report an error if the type is an invalid C (defined) type
 			// (go.dev/issue/22090)
-			if isValid(under(t)) {
+			if isValid(t.Underlying()) {
 				check.errorf(typ, InvalidConstType, "invalid constant type %s", t)
 			}
 			obj.typ = Typ[Invalid]
@@ -516,14 +527,7 @@ func (check *Checker) varDecl(obj *Var, lhs []*Var, typ, init ast.Expr) {
 
 	if debug {
 		// obj must be one of lhs
-		found := false
-		for _, lhs := range lhs {
-			if obj == lhs {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(lhs, obj) {
 			panic("inconsistent lhs")
 		}
 	}
@@ -547,7 +551,7 @@ func (check *Checker) isImportedConstraint(typ Type) bool {
 	if named == nil || named.obj.pkg == check.pkg || named.obj.pkg == nil {
 		return false
 	}
-	u, _ := named.under().(*Interface)
+	u, _ := named.Underlying().(*Interface)
 	return u != nil && !u.IsMethodSet()
 }
 
@@ -583,12 +587,18 @@ func (check *Checker) typeDecl(obj *TypeName, tdecl *ast.TypeSpec, def *TypeName
 			versionErr = true
 		}
 
-		if check.enableAlias {
-			// TODO(gri) Should be able to use nil instead of Typ[Invalid] to mark
-			//           the alias as incomplete. Currently this causes problems
-			//           with certain cycles. Investigate.
-			alias := check.newAlias(obj, Typ[Invalid])
+		if check.conf._EnableAlias {
+			alias := check.newAlias(obj, nil)
 			setDefType(def, alias)
+
+			// If we could not type the RHS, set it to invalid. This should
+			// only ever happen if we panic before setting.
+			defer func() {
+				if alias.fromRHS == nil {
+					alias.fromRHS = Typ[Invalid]
+					unalias(alias)
+				}
+			}()
 
 			// handle type parameters even if not allowed (Alias type is supported)
 			if tparam0 != nil {
@@ -599,11 +609,19 @@ func (check *Checker) typeDecl(obj *TypeName, tdecl *ast.TypeSpec, def *TypeName
 
 			rhs = check.definedType(tdecl.Type, obj)
 			assert(rhs != nil)
+
 			alias.fromRHS = rhs
-			Unalias(alias) // resolve alias.actual
+			unalias(alias) // populate alias.actual
 		} else {
+			// With Go1.23, the default behavior is to use Alias nodes,
+			// reflected by check.enableAlias. Signal non-default behavior.
+			//
+			// TODO(gri) Testing runs tests in both modes. Do we need to exclude
+			//           tracking of non-default behavior for tests?
+			gotypesalias.IncNonDefault()
+
 			if !versionErr && tparam0 != nil {
-				check.error(tdecl, UnsupportedFeature, "generic type alias requires GODEBUG=gotypesalias=1")
+				check.error(tdecl, UnsupportedFeature, "generic type alias requires GODEBUG=gotypesalias=1 or unset")
 				versionErr = true
 			}
 
@@ -622,31 +640,33 @@ func (check *Checker) typeDecl(obj *TypeName, tdecl *ast.TypeSpec, def *TypeName
 	named := check.newNamed(obj, nil, nil)
 	setDefType(def, named)
 
+	// The RHS of a named N can be nil if, for example, N is defined as a cycle of aliases with
+	// gotypesalias=0. Consider:
+	//
+	//   type D N    // N.unpack() will panic
+	//   type N A
+	//   type A = N  // N.fromRHS is not set before N.unpack(), since A does not call setDefType
+	//
+	// There is likely a better way to detect such cases, but it may not be worth the effort.
+	// Instead, we briefly permit a nil N.fromRHS while type-checking D.
+	named.allowNilRHS = true
+	defer (func() { named.allowNilRHS = false })()
+
 	if tdecl.TypeParams != nil {
 		check.openScope(tdecl, "type parameters")
 		defer check.closeScope()
 		check.collectTypeParams(&named.tparams, tdecl.TypeParams)
 	}
 
-	// determine underlying type of named
 	rhs = check.definedType(tdecl.Type, obj)
 	assert(rhs != nil)
 	named.fromRHS = rhs
 
-	// If the underlying type was not set while type-checking the right-hand
-	// side, it is invalid and an error should have been reported elsewhere.
-	if named.underlying == nil {
-		named.underlying = Typ[Invalid]
-	}
-
-	// Disallow a lone type parameter as the RHS of a type declaration (go.dev/issue/45639).
-	// We don't need this restriction anymore if we make the underlying type of a type
-	// parameter its constraint interface: if the RHS is a lone type parameter, we will
-	// use its underlying type (like we do for any RHS in a type declaration), and its
-	// underlying type is an interface and the type declaration is well defined.
+	// spec: "In a type definition the given type cannot be a type parameter."
+	// (See also go.dev/issue/45639.)
 	if isTypeParam(rhs) {
 		check.error(tdecl.Type, MisplacedTypeParam, "cannot use a type parameter as RHS in type declaration")
-		named.underlying = Typ[Invalid]
+		named.fromRHS = Typ[Invalid]
 	}
 }
 
@@ -657,7 +677,9 @@ func (check *Checker) collectTypeParams(dst **TypeParamList, list *ast.FieldList
 	// list (so we can have mutually recursive parameterized interfaces).
 	scopePos := list.Pos()
 	for _, f := range list.List {
-		tparams = check.declareTypeParams(tparams, f.Names, scopePos)
+		for _, name := range f.Names {
+			tparams = append(tparams, check.declareTypeParam(name, scopePos))
+		}
 	}
 
 	// Set the type parameters before collecting the type constraints because
@@ -726,25 +748,17 @@ func (check *Checker) bound(x ast.Expr) Type {
 	return check.typ(x)
 }
 
-func (check *Checker) declareTypeParams(tparams []*TypeParam, names []*ast.Ident, scopePos token.Pos) []*TypeParam {
+func (check *Checker) declareTypeParam(name *ast.Ident, scopePos token.Pos) *TypeParam {
 	// Use Typ[Invalid] for the type constraint to ensure that a type
 	// is present even if the actual constraint has not been assigned
 	// yet.
 	// TODO(gri) Need to systematically review all uses of type parameter
 	//           constraints to make sure we don't rely on them if they
 	//           are not properly set yet.
-	for _, name := range names {
-		tname := NewTypeName(name.Pos(), check.pkg, name.Name, nil)
-		tpar := check.newTypeParam(tname, Typ[Invalid]) // assigns type to tpar as a side-effect
-		check.declare(check.scope, name, tname, scopePos)
-		tparams = append(tparams, tpar)
-	}
-
-	if check.conf._Trace && len(names) > 0 {
-		check.trace(names[0].Pos(), "type params = %v", tparams[len(tparams)-len(names):])
-	}
-
-	return tparams
+	tname := NewTypeName(name.Pos(), check.pkg, name.Name, nil)
+	tpar := check.newTypeParam(tname, Typ[Invalid]) // assigns type to tname as a side-effect
+	check.declare(check.scope, name, tname, scopePos)
+	return tpar
 }
 
 func (check *Checker) collectMethods(obj *TypeName) {
@@ -805,7 +819,7 @@ func (check *Checker) collectMethods(obj *TypeName) {
 }
 
 func (check *Checker) checkFieldUniqueness(base *Named) {
-	if t, _ := base.under().(*Struct); t != nil {
+	if t, _ := base.Underlying().(*Struct); t != nil {
 		var mset objset
 		for i := 0; i < base.NumMethods(); i++ {
 			m := base.Method(i)
@@ -825,7 +839,7 @@ func (check *Checker) checkFieldUniqueness(base *Named) {
 					// For historical consistency, we report the primary error on the
 					// method, and the alt decl on the field.
 					err := check.newError(DuplicateFieldAndMethod)
-					err.addf(alt, "field and method with the same name %s", quote(fld.name))
+					err.addf(alt, "field and method with the same name %s", fld.name)
 					err.addAltDecl(fld)
 					err.report()
 				}
@@ -912,7 +926,7 @@ func (check *Checker) declStmt(d ast.Decl) {
 
 			lhs0 := make([]*Var, len(d.spec.Names))
 			for i, name := range d.spec.Names {
-				lhs0[i] = NewVar(name.Pos(), pkg, name.Name, nil)
+				lhs0[i] = newVar(LocalVar, name.Pos(), pkg, name.Name, nil)
 			}
 
 			// initialize all variables

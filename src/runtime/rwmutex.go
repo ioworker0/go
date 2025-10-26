@@ -5,7 +5,7 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 )
 
 // This is a copy of sync/rwmutex.go rewritten to work in the runtime.
@@ -72,9 +72,7 @@ func (rw *rwmutex) rlock() {
 	// things blocking on the lock may consume all of the Ps and
 	// deadlock (issue #20903). Alternatively, we could drop the P
 	// while sleeping.
-	acquirem()
-
-	acquireLockRank(rw.readRank)
+	acquireLockRankAndM(rw.readRank)
 	lockWithRankMayAcquire(&rw.rLock, getLockRank(&rw.rLock))
 
 	if rw.readerCount.Add(1) < 0 {
@@ -116,8 +114,7 @@ func (rw *rwmutex) runlock() {
 			unlock(&rw.rLock)
 		}
 	}
-	releaseLockRank(rw.readRank)
-	releasem(getg().m)
+	releaseLockRankAndM(rw.readRank)
 }
 
 // lock locks rw for writing.

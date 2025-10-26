@@ -5,7 +5,6 @@
 package slog
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -68,6 +67,15 @@ func Group(key string, args ...any) Attr {
 	return Attr{key, GroupValue(argsToAttrSlice(args)...)}
 }
 
+// GroupAttrs returns an Attr for a Group [Value]
+// consisting of the given Attrs.
+//
+// GroupAttrs is a more efficient version of [Group]
+// that accepts only [Attr] values.
+func GroupAttrs(key string, attrs ...Attr) Attr {
+	return Attr{key, GroupValue(attrs...)}
+}
+
 func argsToAttrSlice(args []any) []Attr {
 	var (
 		attr  Attr
@@ -92,7 +100,7 @@ func (a Attr) Equal(b Attr) bool {
 }
 
 func (a Attr) String() string {
-	return fmt.Sprintf("%s=%s", a.Key, a.Value)
+	return a.Key + "=" + a.Value.String()
 }
 
 // isEmpty reports whether a has an empty key and a nil value.

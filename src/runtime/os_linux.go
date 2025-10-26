@@ -7,8 +7,9 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
-	"internal/runtime/syscall"
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
+	"internal/runtime/strconv"
+	"internal/runtime/syscall/linux"
 	"unsafe"
 )
 
@@ -31,10 +32,13 @@ type mOS struct {
 	// needPerThreadSyscall indicates that a per-thread syscall is required
 	// for doAllThreadsSyscall.
 	needPerThreadSyscall atomic.Uint8
-}
 
-//go:noescape
-func futex(addr unsafe.Pointer, op int32, val uint32, ts, addr2 unsafe.Pointer, val3 uint32) int32
+	// This is a pointer to a chunk of memory allocated with a special
+	// mmap invocation in vgetrandomGetState().
+	vgetrandomState uintptr
+
+	waitsema uint32 // semaphore for parking on locks
+}
 
 // Linux futex.
 //
@@ -72,7 +76,7 @@ func futexsleep(addr *uint32, val uint32, ns int64) {
 
 	var ts timespec
 	ts.setNsec(ns)
-	futex(unsafe.Pointer(addr), _FUTEX_WAIT_PRIVATE, val, unsafe.Pointer(&ts), nil, 0)
+	futex(unsafe.Pointer(addr), _FUTEX_WAIT_PRIVATE, val, &ts, nil, 0)
 }
 
 // If any procs are sleeping on addr, wake up at most cnt.
@@ -94,7 +98,7 @@ func futexwakeup(addr *uint32, cnt uint32) {
 	*(*int32)(unsafe.Pointer(uintptr(0x1006))) = 0x1006
 }
 
-func getproccount() int32 {
+func getCPUCount() int32 {
 	// This buffer is huge (8 kB) but we are on the system stack
 	// and there should be plenty of space (64 kB).
 	// Also this is a leaf, so we're not holding up the memory for long.
@@ -200,7 +204,7 @@ func newosproc(mp *m) {
 //
 //go:nosplit
 func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
-	stack := sysAlloc(stacksize, &memstats.stacks_sys)
+	stack := sysAlloc(stacksize, &memstats.stacks_sys, "OS thread stack")
 	if stack == nil {
 		writeErrStr(failallocatestack)
 		exit(1)
@@ -292,13 +296,19 @@ func sysargs(argc int32, argv **byte) {
 var secureMode bool
 
 func sysauxv(auxv []uintptr) (pairs int) {
+	// Process the auxiliary vector entries provided by the kernel when the
+	// program is executed. See getauxval(3).
 	var i int
 	for ; auxv[i] != _AT_NULL; i += 2 {
 		tag, val := auxv[i], auxv[i+1]
 		switch tag {
 		case _AT_RANDOM:
-			// The kernel provides a pointer to 16-bytes
-			// worth of random data.
+			// The kernel provides a pointer to 16 bytes of cryptographically
+			// random data. Note that in cgo programs this value may have
+			// already been used by libc at this point, and in particular glibc
+			// and musl use the value as-is for stack and pointer protector
+			// cookies from libc_start_main and/or dl_start. Also, cgo programs
+			// may use the value after we do.
 			startupRand = (*[16]byte)(unsafe.Pointer(val))[:]
 
 		case _AT_PAGESZ:
@@ -329,7 +339,7 @@ func getHugePageSize() uintptr {
 		return 0
 	}
 	n-- // remove trailing newline
-	v, ok := atoi(slicebytetostringtmp((*byte)(ptr), int(n)))
+	v, ok := strconv.Atoi(slicebytetostringtmp((*byte)(ptr), int(n)))
 	if !ok || v < 0 {
 		v = 0
 	}
@@ -341,14 +351,16 @@ func getHugePageSize() uintptr {
 }
 
 func osinit() {
-	ncpu = getproccount()
+	numCPUStartup = getCPUCount()
 	physHugePageSize = getHugePageSize()
-	osArchInit()
+	vgetrandomInit()
 }
 
 var urandom_dev = []byte("/dev/urandom\x00")
 
 func readRandom(r []byte) int {
+	// Note that all supported Linux kernels should provide AT_RANDOM which
+	// populates startupRand, so this fallback should be unreachable.
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
 	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	closefd(fd)
@@ -397,14 +409,18 @@ func unminit() {
 	getg().m.procid = 0
 }
 
-// Called from exitm, but not from drop, to undo the effect of thread-owned
+// Called from mexit, but not from dropm, to undo the effect of thread-owned
 // resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+//
+// This always runs without a P, so //go:nowritebarrierrec is required.
+//
+//go:nowritebarrierrec
 func mdestroy(mp *m) {
 }
 
-//#ifdef GOARCH_386
-//#define sa_handler k_sa_handler
-//#endif
+// #ifdef GOARCH_386
+// #define sa_handler k_sa_handler
+// #endif
 
 func sigreturn__sigaction()
 func sigtramp() // Called via C ABI
@@ -418,9 +434,6 @@ func setitimer(mode int32, new, old *itimerval)
 
 //go:noescape
 func timer_create(clockid int32, sevp *sigevent, timerid *int32) int32
-
-//go:noescape
-func timer_settime(timerid int32, flags int32, new, old *itimerspec) int32
 
 //go:noescape
 func timer_delete(timerid int32) int32
@@ -450,7 +463,7 @@ func pipe2(flags int32) (r, w int32, errno int32)
 
 //go:nosplit
 func fcntl(fd, cmd, arg int32) (ret int32, errno int32) {
-	r, _, err := syscall.Syscall6(syscall.SYS_FCNTL, uintptr(fd), uintptr(cmd), uintptr(arg), 0, 0, 0)
+	r, _, err := linux.Syscall6(linux.SYS_FCNTL, uintptr(fd), uintptr(cmd), uintptr(arg), 0, 0, 0)
 	return int32(r), int32(err)
 }
 
@@ -467,7 +480,8 @@ func setsig(i uint32, fn uintptr) {
 	sigfillset(&sa.sa_mask)
 	// Although Linux manpage says "sa_restorer element is obsolete and
 	// should not be used". x86_64 kernel requires it. Only use it on
-	// x86.
+	// x86. Note that on 386 this is cleared when using the C sigaction
+	// function via cgo; see fixSigactionForCgo.
 	if GOARCH == "386" || GOARCH == "amd64" {
 		sa.sa_restorer = abi.FuncPCABI0(sigreturn__sigaction)
 	}
@@ -542,6 +556,21 @@ func sysSigaction(sig uint32, new, old *sigactiont) {
 //
 //go:noescape
 func rt_sigaction(sig uintptr, new, old *sigactiont, size uintptr) int32
+
+// fixSigactionForCgo is called when we are using cgo to call the
+// C sigaction function. On 386 the C function does not expect the
+// SA_RESTORER flag to be set, and in some cases will fail if it is set:
+// it will pass the SA_RESTORER flag to the kernel without passing
+// the sa_restorer field. Since the C function will handle SA_RESTORER
+// for us, we need not pass it. See issue #75253.
+//
+//go:nosplit
+func fixSigactionForCgo(new *sigactiont) {
+	if GOARCH == "386" && new != nil {
+		new.sa_flags &^= _SA_RESTORER
+		new.sa_restorer = 0
+	}
+}
 
 func getpid() int
 func tgkill(tgid, tid, sig int)
@@ -636,7 +665,7 @@ func setThreadCPUProfiler(hz int32) {
 	// spend shows up as a 10% chance of one sample (for an expected value of
 	// 0.1 samples), and so that "two and six tenths" periods of CPU spend show
 	// up as a 60% chance of 3 samples and a 40% chance of 2 samples (for an
-	// expected value of 2.6). Set the initial delay to a value in the unifom
+	// expected value of 2.6). Set the initial delay to a value in the uniform
 	// random distribution between 0 and the desired period. And because "0"
 	// means "disable timer", add 1 so the half-open interval [0,period) turns
 	// into (0,period].
@@ -753,7 +782,7 @@ func syscall_runtime_doAllThreadsSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr) (
 	// ensuring all threads execute system calls from multiple calls in the
 	// same order.
 
-	r1, r2, errno := syscall.Syscall6(trap, a1, a2, a3, a4, a5, a6)
+	r1, r2, errno := linux.Syscall6(trap, a1, a2, a3, a4, a5, a6)
 	if GOARCH == "ppc64" || GOARCH == "ppc64le" {
 		// TODO(https://go.dev/issue/51192 ): ppc64 doesn't use r2.
 		r2 = 0
@@ -864,7 +893,7 @@ func runPerThreadSyscall() {
 	}
 
 	args := perThreadSyscall
-	r1, r2, errno := syscall.Syscall6(args.trap, args.a1, args.a2, args.a3, args.a4, args.a5, args.a6)
+	r1, r2, errno := linux.Syscall6(args.trap, args.a1, args.a2, args.a3, args.a4, args.a5, args.a6)
 	if GOARCH == "ppc64" || GOARCH == "ppc64le" {
 		// TODO(https://go.dev/issue/51192 ): ppc64 doesn't use r2.
 		r2 = 0
@@ -879,8 +908,9 @@ func runPerThreadSyscall() {
 }
 
 const (
-	_SI_USER  = 0
-	_SI_TKILL = -6
+	_SI_USER     = 0
+	_SI_TKILL    = -6
+	_SYS_SECCOMP = 1
 )
 
 // sigFromUser reports whether the signal was sent because of a call
@@ -892,8 +922,16 @@ func (c *sigctxt) sigFromUser() bool {
 	return code == _SI_USER || code == _SI_TKILL
 }
 
+// sigFromSeccomp reports whether the signal was sent from seccomp.
+//
+//go:nosplit
+func (c *sigctxt) sigFromSeccomp() bool {
+	code := int32(c.sigcode())
+	return code == _SYS_SECCOMP
+}
+
 //go:nosplit
 func mprotect(addr unsafe.Pointer, n uintptr, prot int32) (ret int32, errno int32) {
-	r, _, err := syscall.Syscall6(syscall.SYS_MPROTECT, uintptr(addr), n, uintptr(prot), 0, 0, 0)
+	r, _, err := linux.Syscall6(linux.SYS_MPROTECT, uintptr(addr), n, uintptr(prot), 0, 0, 0)
 	return int32(r), int32(err)
 }

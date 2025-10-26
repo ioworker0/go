@@ -6,6 +6,7 @@ package base
 
 import (
 	"cmd/internal/cov/covcmd"
+	"cmd/internal/telemetry/counter"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -177,13 +178,16 @@ func ParseFlags() {
 
 	Debug.ConcurrentOk = true
 	Debug.MaxShapeLen = 500
+	Debug.AlignHot = 1
 	Debug.InlFuncsWithClosures = 1
 	Debug.InlStaticInit = 1
 	Debug.PGOInline = 1
 	Debug.PGODevirtualize = 2
-	Debug.SyncFrames = -1 // disable sync markers by default
+	Debug.SyncFrames = -1            // disable sync markers by default
+	Debug.VariableMakeThreshold = 32 // 32 byte default for stack allocated make results
 	Debug.ZeroCopy = 1
 	Debug.RangeFuncCheck = 1
+	Debug.MergeLocals = 1
 
 	Debug.Checkptr = -1 // so we can tell whether it is set explicitly
 
@@ -192,6 +196,7 @@ func ParseFlags() {
 	objabi.AddVersionFlag() // -V
 	registerFlags()
 	objabi.Flagparse(usage)
+	counter.CountFlags("compile/flag:", *flag.CommandLine)
 
 	if gcd := os.Getenv("GOCOMPILEDEBUG"); gcd != "" {
 		// This will only override the flags set in gcd;
@@ -202,12 +207,15 @@ func ParseFlags() {
 	if Debug.Gossahash != "" {
 		hashDebug = NewHashDebug("gossahash", Debug.Gossahash, nil)
 	}
+	obj.SetFIPSDebugHash(Debug.FIPSHash)
 
 	// Compute whether we're compiling the runtime from the package path. Test
 	// code can also use the flag to set this explicitly.
 	if Flag.Std && objabi.LookupPkgSpecial(Ctxt.Pkgpath).Runtime {
 		Flag.CompilingRuntime = true
 	}
+
+	Ctxt.Std = Flag.Std
 
 	// Three inputs govern loop iteration variable rewriting, hash, experiment, flag.
 	// The loop variable rewriting is:
@@ -254,11 +262,27 @@ func ParseFlags() {
 		Debug.LoopVar = 1
 	}
 
+	if Debug.Converthash != "" {
+		ConvertHash = NewHashDebug("converthash", Debug.Converthash, nil)
+	} else {
+		// quietly disable the convert hash changes
+		ConvertHash = NewHashDebug("converthash", "qn", nil)
+	}
 	if Debug.Fmahash != "" {
 		FmaHash = NewHashDebug("fmahash", Debug.Fmahash, nil)
 	}
 	if Debug.PGOHash != "" {
 		PGOHash = NewHashDebug("pgohash", Debug.PGOHash, nil)
+	}
+	if Debug.LiteralAllocHash != "" {
+		LiteralAllocHash = NewHashDebug("literalalloc", Debug.LiteralAllocHash, nil)
+	}
+
+	if Debug.MergeLocalsHash != "" {
+		MergeLocalsHash = NewHashDebug("mergelocals", Debug.MergeLocalsHash, nil)
+	}
+	if Debug.VariableMakeHash != "" {
+		VariableMakeHash = NewHashDebug("variablemake", Debug.VariableMakeHash, nil)
 	}
 
 	if Flag.MSan && !platform.MSanSupported(buildcfg.GOOS, buildcfg.GOARCH) {
@@ -354,20 +378,25 @@ func ParseFlags() {
 
 	// set via a -d flag
 	Ctxt.Debugpcln = Debug.PCTab
+
+	// https://golang.org/issue/67502
+	if buildcfg.GOOS == "plan9" && buildcfg.GOARCH == "386" {
+		Debug.AlignHot = 0
+	}
 }
 
 // registerFlags adds flag registrations for all the fields in Flag.
 // See the comment on type CmdFlags for the rules.
 func registerFlags() {
 	var (
-		boolType      = reflect.TypeOf(bool(false))
-		intType       = reflect.TypeOf(int(0))
-		stringType    = reflect.TypeOf(string(""))
-		ptrBoolType   = reflect.TypeOf(new(bool))
-		ptrIntType    = reflect.TypeOf(new(int))
-		ptrStringType = reflect.TypeOf(new(string))
-		countType     = reflect.TypeOf(CountFlag(0))
-		funcType      = reflect.TypeOf((func(string))(nil))
+		boolType      = reflect.TypeFor[bool]()
+		intType       = reflect.TypeFor[int]()
+		stringType    = reflect.TypeFor[string]()
+		ptrBoolType   = reflect.TypeFor[*bool]()
+		ptrIntType    = reflect.TypeFor[*int]()
+		ptrStringType = reflect.TypeFor[*string]()
+		countType     = reflect.TypeFor[CountFlag]()
+		funcType      = reflect.TypeFor[func(string)]()
 	)
 
 	v := reflect.ValueOf(&Flag).Elem()
@@ -547,7 +576,7 @@ func readEmbedCfg(file string) {
 
 // parseSpectre parses the spectre configuration from the string s.
 func parseSpectre(s string) {
-	for _, f := range strings.Split(s, ",") {
+	for f := range strings.SplitSeq(s, ",") {
 		f = strings.TrimSpace(f)
 		switch f {
 		default:

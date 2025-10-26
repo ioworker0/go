@@ -7,9 +7,8 @@
 package main
 
 import (
-	"bytes"
 	"cmd/internal/buildid"
-	"cmd/internal/notsha256"
+	"cmd/internal/hash"
 	"cmd/link/internal/ld"
 	"debug/elf"
 	"fmt"
@@ -58,6 +57,12 @@ s2:
 var goSource = `
 package main
 func main() {}
+`
+
+var goSourceWithData = `
+package main
+var globalVar = 42
+func main() { println(&globalVar) }
 `
 
 // The linker used to crash if an ELF input file had multiple text sections
@@ -203,36 +208,53 @@ func TestMinusRSymsWithSameName(t *testing.T) {
 	}
 }
 
-func TestGNUBuildIDDerivedFromGoBuildID(t *testing.T) {
+func TestGNUBuildID(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
 	t.Parallel()
 
-	goFile := filepath.Join(t.TempDir(), "notes.go")
+	tmpdir := t.TempDir()
+	goFile := filepath.Join(tmpdir, "notes.go")
 	if err := os.WriteFile(goFile, []byte(goSource), 0444); err != nil {
 		t.Fatal(err)
 	}
-	outFile := filepath.Join(t.TempDir(), "notes.exe")
-	goTool := testenv.GoToolPath(t)
 
-	cmd := testenv.Command(t, goTool, "build", "-o", outFile, "-ldflags", "-buildid 0x1234 -B gobuildid", goFile)
-	cmd.Dir = t.TempDir()
+	// Use a specific Go buildid for testing.
+	const gobuildid = "testbuildid"
+	h := hash.Sum32([]byte(gobuildid))
+	gobuildidHash := string(h[:20])
 
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Logf("%s", out)
-		t.Fatal(err)
+	tests := []struct{ name, ldflags, expect string }{
+		{"default", "", gobuildidHash},
+		{"gobuildid", "-B=gobuildid", gobuildidHash},
+		{"specific", "-B=0x0123456789abcdef", "\x01\x23\x45\x67\x89\xab\xcd\xef"},
+		{"none", "-B=none", ""},
 	}
-
-	expectedGoBuildID := notsha256.Sum256([]byte("0x1234"))
-
-	gnuBuildID, err := buildid.ReadELFNote(outFile, string(ld.ELF_NOTE_BUILDINFO_NAME), ld.ELF_NOTE_BUILDINFO_TAG)
-	if err != nil || gnuBuildID == nil {
-		t.Fatalf("can't read GNU build ID")
+	if testenv.HasCGO() && runtime.GOOS != "solaris" && runtime.GOOS != "illumos" {
+		// Solaris ld doesn't support --build-id. So we don't
+		// add it in external linking mode.
+		for _, test := range tests {
+			t1 := test
+			t1.name += "_external"
+			t1.ldflags += " -linkmode=external"
+			tests = append(tests, t1)
+		}
 	}
-
-	if !bytes.Equal(gnuBuildID, expectedGoBuildID[:20]) {
-		t.Fatalf("build id not matching")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exe := filepath.Join(tmpdir, test.name)
+			cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-ldflags=-buildid="+gobuildid+" "+test.ldflags, "-o", exe, goFile)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v: %v:\n%s", cmd.Args, err, out)
+			}
+			gnuBuildID, err := buildid.ReadELFNote(exe, string(ld.ELF_NOTE_BUILDINFO_NAME), ld.ELF_NOTE_BUILDINFO_TAG)
+			if err != nil {
+				t.Fatalf("can't read GNU build ID")
+			}
+			if string(gnuBuildID) != test.expect {
+				t.Errorf("build id mismatch: got %x, want %x", gnuBuildID, test.expect)
+			}
+		})
 	}
 }
 
@@ -341,16 +363,14 @@ func TestPIESize(t *testing.T) {
 		}
 	}
 
-	for _, external := range []bool{false, true} {
-		external := external
+	var linkmodes []string
+	if platform.InternalLinkPIESupported(runtime.GOOS, runtime.GOARCH) {
+		linkmodes = append(linkmodes, "internal")
+	}
+	linkmodes = append(linkmodes, "external")
 
-		name := "TestPieSize-"
-		if external {
-			name += "external"
-		} else {
-			name += "internal"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, linkmode := range linkmodes {
+		t.Run(fmt.Sprintf("TestPieSize-%v", linkmode), func(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
@@ -359,16 +379,11 @@ func TestPIESize(t *testing.T) {
 
 			binexe := filepath.Join(dir, "exe")
 			binpie := filepath.Join(dir, "pie")
-			if external {
-				binexe += "external"
-				binpie += "external"
-			}
+			binexe += linkmode
+			binpie += linkmode
 
 			build := func(bin, mode string) error {
-				cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", bin, "-buildmode="+mode)
-				if external {
-					cmd.Args = append(cmd.Args, "-ldflags=-linkmode=external")
-				}
+				cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", bin, "-buildmode="+mode, "-ldflags=-linkmode="+linkmode)
 				cmd.Args = append(cmd.Args, "pie.go")
 				cmd.Dir = dir
 				t.Logf("%v", cmd.Args)
@@ -558,5 +573,108 @@ func TestFlagR(t *testing.T) {
 	cmd = testenv.Command(t, exe)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("executable failed to run: %v\n%s", err, out)
+	}
+}
+
+func TestFlagD(t *testing.T) {
+	// Test that using the -D flag to specify data section address generates
+	// a working binary with data at the specified address.
+	t.Parallel()
+	testFlagD(t, "0x10000000", "", 0x10000000)
+}
+
+func TestFlagDUnaligned(t *testing.T) {
+	// Test that using the -D flag with an unaligned address errors out
+	t.Parallel()
+	testFlagDError(t, "0x10000123", "", "invalid -D value 0x10000123")
+}
+
+func TestFlagDWithR(t *testing.T) {
+	// Test that using the -D flag with -R flag errors on unaligned address.
+	t.Parallel()
+	testFlagDError(t, "0x30001234", "8192", "invalid -D value 0x30001234")
+}
+
+func testFlagD(t *testing.T, dataAddr string, roundQuantum string, expectedAddr uint64) {
+	testenv.MustHaveGoBuild(t)
+	tmpdir := t.TempDir()
+	src := filepath.Join(tmpdir, "x.go")
+	if err := os.WriteFile(src, []byte(goSourceWithData), 0444); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(tmpdir, "x.exe")
+
+	// Build linker flags
+	ldflags := "-D=" + dataAddr
+	if roundQuantum != "" {
+		ldflags += " -R=" + roundQuantum
+	}
+
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-ldflags="+ldflags, "-o", exe, src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v, output:\n%s", err, out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("executable failed to run: %v\n%s", err, out)
+	}
+
+	ef, err := elf.Open(exe)
+	if err != nil {
+		t.Fatalf("open elf file failed: %v", err)
+	}
+	defer ef.Close()
+
+	// Find the first data-related section to verify segment placement
+	var firstDataSection *elf.Section
+	for _, sec := range ef.Sections {
+		if sec.Type == elf.SHT_PROGBITS || sec.Type == elf.SHT_NOBITS {
+			// These sections are writable, allocated at runtime, but not executable
+			// nor TLS.
+			isWrite := sec.Flags&elf.SHF_WRITE != 0
+			isExec := sec.Flags&elf.SHF_EXECINSTR != 0
+			isAlloc := sec.Flags&elf.SHF_ALLOC != 0
+			isTLS := sec.Flags&elf.SHF_TLS != 0
+
+			if isWrite && !isExec && isAlloc && !isTLS {
+				if firstDataSection == nil || sec.Addr < firstDataSection.Addr {
+					firstDataSection = sec
+				}
+			}
+		}
+	}
+
+	if firstDataSection == nil {
+		t.Fatalf("can't find any writable data sections")
+	}
+	if firstDataSection.Addr != expectedAddr {
+		t.Errorf("data section starts at 0x%x for section %s, expected 0x%x",
+			firstDataSection.Addr, firstDataSection.Name, expectedAddr)
+	}
+}
+
+func testFlagDError(t *testing.T, dataAddr string, roundQuantum string, expectedError string) {
+	testenv.MustHaveGoBuild(t)
+	tmpdir := t.TempDir()
+	src := filepath.Join(tmpdir, "x.go")
+	if err := os.WriteFile(src, []byte(goSourceWithData), 0444); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(tmpdir, "x.exe")
+
+	// Build linker flags
+	ldflags := "-D=" + dataAddr
+	if roundQuantum != "" {
+		ldflags += " -R=" + roundQuantum
+	}
+
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-ldflags="+ldflags, "-o", exe, src)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected build to fail with unaligned data address, but it succeeded")
+	}
+	if !strings.Contains(string(out), expectedError) {
+		t.Errorf("expected error message to contain %q, got:\n%s", expectedError, out)
 	}
 }

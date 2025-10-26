@@ -192,6 +192,9 @@ func main() {
 	if _, err := fd.Write(source); err != nil {
 		log.Fatal(err)
 	}
+	if err := fd.Close(); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func printMaps(b *bytes.Buffer, upperClass string) {
@@ -228,7 +231,7 @@ func dec%[2]sArray(state *decoderState, v reflect.Value, length int, ovfl error)
 
 const sliceHelper = `
 func dec%[2]sSlice(state *decoderState, v reflect.Value, length int, ovfl error) bool {
-	slice, ok := v.Interface().([]%[1]s)
+	slice, ok := reflect.TypeAssert[[]%[1]s](v)
 	if !ok {
 		// It is kind %[1]s but not type %[1]s. TODO: We can handle this unsafely.
 		return false

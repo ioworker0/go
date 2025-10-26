@@ -204,7 +204,7 @@ func stdlibPackageHeading(pkg string, lastLine int) *md.Heading {
 			Position: pos,
 			Inline: []md.Inline{
 				&md.Link{
-					Inner: []md.Inline{&md.Plain{Text: pkg}},
+					Inner: []md.Inline{&md.Code{Text: pkg}},
 					URL:   "/pkg/" + pkg + "/",
 				},
 			},
@@ -462,5 +462,8 @@ func checkFragmentFile(fsys fs.FS, filename string) error {
 	}
 	defer f.Close()
 	data, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
 	return CheckFragment(string(data))
 }

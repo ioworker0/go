@@ -6,12 +6,15 @@ package slices_test
 
 import (
 	"cmp"
+	"internal/asan"
+	"internal/msan"
 	"internal/race"
 	"internal/testenv"
 	"math"
 	. "slices"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 var equalIntTests = []struct {
@@ -496,7 +499,7 @@ func TestInsert(t *testing.T) {
 		}
 	}
 
-	if !testenv.OptimizationOff() && !race.Enabled {
+	if !testenv.OptimizationOff() && !race.Enabled && !asan.Enabled && !msan.Enabled {
 		// Allocations should be amortized.
 		const count = 50
 		n := testing.AllocsPerRun(10, func() {
@@ -763,7 +766,7 @@ var compactTests = []struct {
 		[]int{1, 2, 3},
 	},
 	{
-		"1 item",
+		"2 items",
 		[]int{1, 1, 2},
 		[]int{1, 2},
 	},
@@ -802,12 +805,26 @@ func BenchmarkCompact(b *testing.B) {
 }
 
 func BenchmarkCompact_Large(b *testing.B) {
-	type Large [4 * 1024]byte
+	type Large [16]int
+	const N = 1024
 
-	ss := make([]Large, 1024)
-	for i := 0; i < b.N; i++ {
-		_ = Compact(ss)
-	}
+	b.Run("all_dup", func(b *testing.B) {
+		ss := make([]Large, N)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = Compact(ss)
+		}
+	})
+	b.Run("no_dup", func(b *testing.B) {
+		ss := make([]Large, N)
+		for i := range ss {
+			ss[i][0] = i
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = Compact(ss)
+		}
+	})
 }
 
 func TestCompactFunc(t *testing.T) {
@@ -873,13 +890,40 @@ func TestCompactFuncClearTail(t *testing.T) {
 	}
 }
 
-func BenchmarkCompactFunc_Large(b *testing.B) {
-	type Large [4 * 1024]byte
-
-	ss := make([]Large, 1024)
-	for i := 0; i < b.N; i++ {
-		_ = CompactFunc(ss, func(a, b Large) bool { return a == b })
+func BenchmarkCompactFunc(b *testing.B) {
+	for _, c := range compactTests {
+		b.Run(c.name, func(b *testing.B) {
+			ss := make([]int, 0, 64)
+			for k := 0; k < b.N; k++ {
+				ss = ss[:0]
+				ss = append(ss, c.s...)
+				_ = CompactFunc(ss, func(a, b int) bool { return a == b })
+			}
+		})
 	}
+}
+
+func BenchmarkCompactFunc_Large(b *testing.B) {
+	type Element = int
+	const N = 1024 * 1024
+
+	b.Run("all_dup", func(b *testing.B) {
+		ss := make([]Element, N)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = CompactFunc(ss, func(a, b Element) bool { return a == b })
+		}
+	})
+	b.Run("no_dup", func(b *testing.B) {
+		ss := make([]Element, N)
+		for i := range ss {
+			ss[i] = i
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = CompactFunc(ss, func(a, b Element) bool { return a == b })
+		}
+	})
 }
 
 func TestGrow(t *testing.T) {
@@ -911,7 +955,7 @@ func TestGrow(t *testing.T) {
 	}
 	if n := testing.AllocsPerRun(100, func() { _ = Grow(s2, cap(s2)-len(s2)+1) }); n != 1 {
 		errorf := t.Errorf
-		if race.Enabled || testenv.OptimizationOff() {
+		if race.Enabled || msan.Enabled || asan.Enabled || testenv.OptimizationOff() {
 			errorf = t.Logf // this allocates multiple times in race detector mode
 		}
 		errorf("Grow should allocate once when given insufficient capacity; allocated %v times", n)
@@ -968,7 +1012,7 @@ func TestReverse(t *testing.T) {
 	singleton := []string{"one"}
 	Reverse(singleton)
 	if want := []string{"one"}; !Equal(singleton, want) {
-		t.Errorf("Reverse(singeleton) = %v, want %v", singleton, want)
+		t.Errorf("Reverse(singleton) = %v, want %v", singleton, want)
 	}
 
 	Reverse[[]string](nil)
@@ -1272,7 +1316,7 @@ func TestConcat(t *testing.T) {
 		_ = sink
 		if allocs > 1 {
 			errorf := t.Errorf
-			if testenv.OptimizationOff() || race.Enabled {
+			if testenv.OptimizationOff() || race.Enabled || asan.Enabled || msan.Enabled {
 				errorf = t.Logf
 			}
 			errorf("Concat(%v) allocated %v times; want 1", tc.s, allocs)
@@ -1408,4 +1452,99 @@ func TestRepeatPanics(t *testing.T) {
 			t.Errorf("Repeat %s: got no panic, want panic", test.name)
 		}
 	}
+}
+
+var leak *int
+
+func TestIssue68488(t *testing.T) {
+	s := make([]int, 3)
+	clone := Clone(s[1:1])
+	switch unsafe.SliceData(clone) {
+	case &s[0], &s[1], &s[2]:
+		t.Error("clone keeps alive s due to array overlap")
+	}
+	leak = &s[1] // see go.dev/issue/74387
+}
+
+// This test asserts the behavior when the primary slice operand is nil.
+//
+// Some operations preserve the nilness of their operand while others
+// do not, but in all cases the behavior is documented.
+func TestNilness(t *testing.T) {
+	var (
+		emptySlice = []int{}
+		nilSlice   = []int(nil)
+		emptySeq   = func(yield func(int) bool) {}
+		truth      = func(int) bool { return true }
+		equal      = func(x, y int) bool { panic("unreachable") }
+	)
+
+	wantNil := func(slice []int, cond string) {
+		if slice != nil {
+			t.Errorf("%s != nil", cond)
+		}
+	}
+	wantNonNil := func(slice []int, cond string) {
+		if slice == nil {
+			t.Errorf("%s == nil", cond)
+		}
+	}
+
+	// The update functions
+	//    Insert, AppendSeq, Delete, DeleteFunc, Clone, Compact, CompactFunc
+	// preserve nilness, like s[i:j].
+	wantNil(AppendSeq(nilSlice, emptySeq), "AppendSeq(nil, empty)")
+	wantNonNil(AppendSeq(emptySlice, emptySeq), "AppendSeq(nil, empty)")
+
+	wantNil(Insert(nilSlice, 0), "Insert(nil, 0)")
+	wantNonNil(Insert(emptySlice, 0), "Insert(empty, 0)")
+
+	wantNil(Delete(nilSlice, 0, 0), "Delete(nil, 0, 0)")
+	wantNonNil(Delete(emptySlice, 0, 0), "Delete(empty, 0, 0)")
+	wantNonNil(Delete([]int{1}, 0, 1), "Delete([]int{1}, 0, 1)")
+
+	wantNil(DeleteFunc(nilSlice, truth), "DeleteFunc(nil, f)")
+	wantNonNil(DeleteFunc(emptySlice, truth), "DeleteFunc(empty, f)")
+	wantNonNil(DeleteFunc([]int{1}, truth), "DeleteFunc([]int{1}, truth)")
+
+	wantNil(Replace(nilSlice, 0, 0), "Replace(nil, 0, 0)")
+	wantNonNil(Replace(emptySlice, 0, 0), "Replace(empty, 0, 0)")
+	wantNonNil(Replace([]int{1}, 0, 1), "Replace([]int{1}, 0, 1)")
+
+	wantNil(Clone(nilSlice), "Clone(nil)")
+	wantNonNil(Clone(emptySlice), "Clone(empty)")
+
+	wantNil(Compact(nilSlice), "Compact(nil)")
+	wantNonNil(Compact(emptySlice), "Compact(empty)")
+
+	wantNil(CompactFunc(nilSlice, equal), "CompactFunc(nil)")
+	wantNonNil(CompactFunc(emptySlice, equal), "CompactFunc(empty)")
+
+	wantNil(Grow(nilSlice, 0), "Grow(nil, 0)")
+	wantNonNil(Grow(emptySlice, 0), "Grow(empty, 0)")
+
+	wantNil(Clip(nilSlice), "Clip(nil)")
+	wantNonNil(Clip(emptySlice), "Clip(empty)")
+	wantNonNil(Clip([]int{1}[:0:0]), "Clip([]int{1}[:0:0])")
+
+	// Concat returns nil iff the result is empty.
+	// This is an unfortunate irregularity.
+	wantNil(Concat(nilSlice, emptySlice, nilSlice, emptySlice), "Concat(nil, ...empty...)")
+	wantNil(Concat(emptySlice, emptySlice, nilSlice, emptySlice), "Concat(empty, ...empty...)")
+	wantNil(Concat[[]int](), "Concat()")
+
+	// Repeat never returns nil. Another irregularity.
+	wantNonNil(Repeat(nilSlice, 0), "Repeat(nil, 0)")
+	wantNonNil(Repeat(emptySlice, 0), "Repeat(empty, 0)")
+	wantNonNil(Repeat(nilSlice, 2), "Repeat(nil, 2)")
+	wantNonNil(Repeat(emptySlice, 2), "Repeat(empty, 2)")
+
+	// The collection functions
+	//     Collect, Sorted, SortedFunc, SortedStableFunc
+	// return nil given an empty sequence.
+	wantNil(Collect(emptySeq), "Collect(empty)")
+
+	wantNil(Sorted(emptySeq), "Sorted(empty)")
+	wantNil(SortedFunc(emptySeq, cmp.Compare), "SortedFunc(empty)")
+	wantNil(SortedStableFunc(emptySeq, cmp.Compare), "SortedStableFunc(empty)")
 }

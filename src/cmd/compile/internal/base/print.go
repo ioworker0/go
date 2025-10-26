@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"cmd/internal/src"
+	"cmd/internal/telemetry/counter"
 )
 
 // An errorMsg is a queued error message, waiting to be printed.
@@ -194,6 +195,8 @@ func Fatalf(format string, args ...interface{}) {
 	FatalfAt(Pos, format, args...)
 }
 
+var bugStack = counter.NewStack("compile/bug", 16) // 16 is arbitrary; used by gopls and crashmonitor
+
 // FatalfAt reports a fatal error - an internal problem - at pos and exits.
 // If other errors have already been printed, then FatalfAt just quietly exits.
 // (The internal problem may have been caused by incomplete information
@@ -209,13 +212,15 @@ func Fatalf(format string, args ...interface{}) {
 func FatalfAt(pos src.XPos, format string, args ...interface{}) {
 	FlushErrors()
 
+	bugStack.Inc()
+
 	if Debug.Panic != 0 || numErrors == 0 {
 		fmt.Printf("%v: internal compiler error: ", FmtPos(pos))
 		fmt.Printf(format, args...)
 		fmt.Printf("\n")
 
 		// If this is a released compiler version, ask for a bug report.
-		if Debug.Panic == 0 && strings.HasPrefix(buildcfg.Version, "go") {
+		if Debug.Panic == 0 && strings.HasPrefix(buildcfg.Version, "go") && !strings.Contains(buildcfg.Version, "devel") {
 			fmt.Printf("\n")
 			fmt.Printf("Please file a bug report including a short program that triggers the error.\n")
 			fmt.Printf("https://go.dev/issue/new\n")

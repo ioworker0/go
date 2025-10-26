@@ -6,7 +6,7 @@ package runtime_test
 
 import (
 	"bytes"
-	"fmt"
+	"internal/abi"
 	"internal/goexperiment"
 	"internal/profile"
 	"internal/testenv"
@@ -200,10 +200,10 @@ func TestReadMetrics(t *testing.T) {
 	checkUint64(t, "/gc/heap/frees:objects", frees, mstats.Frees-tinyAllocs)
 
 	// Verify that /gc/pauses:seconds is a copy of /sched/pauses/total/gc:seconds
-	if !reflect.DeepEqual(gcPauses.Buckets, schedPausesTotalGC.Buckets) {
+	if !slices.Equal(gcPauses.Buckets, schedPausesTotalGC.Buckets) {
 		t.Errorf("/gc/pauses:seconds buckets %v do not match /sched/pauses/total/gc:seconds buckets %v", gcPauses.Buckets, schedPausesTotalGC.Counts)
 	}
-	if !reflect.DeepEqual(gcPauses.Counts, schedPausesTotalGC.Counts) {
+	if !slices.Equal(gcPauses.Counts, schedPausesTotalGC.Counts) {
 		t.Errorf("/gc/pauses:seconds counts %v do not match /sched/pauses/total/gc:seconds counts %v", gcPauses.Counts, schedPausesTotalGC.Counts)
 	}
 }
@@ -357,11 +357,11 @@ func TestReadMetricsConsistency(t *testing.T) {
 		if cpu.idle <= 0 {
 			t.Errorf("found no idle time: %f", cpu.idle)
 		}
-		if total := cpu.gcDedicated + cpu.gcAssist + cpu.gcIdle + cpu.gcPause; !withinEpsilon(cpu.gcTotal, total, 0.01) {
-			t.Errorf("calculated total GC CPU not within 1%% of sampled total: %f vs. %f", total, cpu.gcTotal)
+		if total := cpu.gcDedicated + cpu.gcAssist + cpu.gcIdle + cpu.gcPause; !withinEpsilon(cpu.gcTotal, total, 0.001) {
+			t.Errorf("calculated total GC CPU time not within %%0.1 of total: %f vs. %f", total, cpu.gcTotal)
 		}
-		if total := cpu.scavengeAssist + cpu.scavengeBg; !withinEpsilon(cpu.scavengeTotal, total, 0.01) {
-			t.Errorf("calculated total scavenge CPU not within 1%% of sampled total: %f vs. %f", total, cpu.scavengeTotal)
+		if total := cpu.scavengeAssist + cpu.scavengeBg; !withinEpsilon(cpu.scavengeTotal, total, 0.001) {
+			t.Errorf("calculated total scavenge CPU not within %%0.1 of total: %f vs. %f", total, cpu.scavengeTotal)
 		}
 		if cpu.total <= 0 {
 			t.Errorf("found no total CPU time passed")
@@ -369,8 +369,8 @@ func TestReadMetricsConsistency(t *testing.T) {
 		if cpu.user <= 0 {
 			t.Errorf("found no user time passed")
 		}
-		if total := cpu.gcTotal + cpu.scavengeTotal + cpu.user + cpu.idle; !withinEpsilon(cpu.total, total, 0.02) {
-			t.Errorf("calculated total CPU not within 2%% of sampled total: %f vs. %f", total, cpu.total)
+		if total := cpu.gcTotal + cpu.scavengeTotal + cpu.user + cpu.idle; !withinEpsilon(cpu.total, total, 0.001) {
+			t.Errorf("calculated total CPU not within %%0.1 of total: %f vs. %f", total, cpu.total)
 		}
 	}
 	if totalVirtual.got != totalVirtual.want {
@@ -499,6 +499,10 @@ func TestReadMetricsCumulative(t *testing.T) {
 		defer wg.Done()
 		for {
 			// Add more things here that could influence metrics.
+			for i := 0; i < 10; i++ {
+				runtime.AddCleanup(new(*int), func(_ struct{}) {}, struct{}{})
+				runtime.SetFinalizer(new(*int), func(_ **int) {})
+			}
 			for i := 0; i < len(readMetricsSink); i++ {
 				readMetricsSink[i] = make([]byte, 1024)
 				select {
@@ -948,23 +952,10 @@ func TestSchedPauseMetrics(t *testing.T) {
 }
 
 func TestRuntimeLockMetricsAndProfile(t *testing.T) {
-	testenv.SkipFlaky(t, 64253)
-
 	old := runtime.SetMutexProfileFraction(0) // enabled during sub-tests
 	defer runtime.SetMutexProfileFraction(old)
 	if old != 0 {
 		t.Fatalf("need MutexProfileRate 0, got %d", old)
-	}
-
-	{
-		before := os.Getenv("GODEBUG")
-		for _, s := range strings.Split(before, ",") {
-			if strings.HasPrefix(s, "runtimecontentionstacks=") {
-				t.Logf("GODEBUG includes explicit setting %q", s)
-			}
-		}
-		defer func() { os.Setenv("GODEBUG", before) }()
-		os.Setenv("GODEBUG", fmt.Sprintf("%s,runtimecontentionstacks=1", before))
 	}
 
 	t.Logf("NumCPU %d", runtime.NumCPU())
@@ -1021,9 +1012,9 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 		return metricGrowth, profileGrowth, p
 	}
 
-	testcase := func(strictTiming bool, acceptStacks [][]string, workers int, fn func() bool) func(t *testing.T) (metricGrowth, profileGrowth float64, n, value int64) {
-		return func(t *testing.T) (metricGrowth, profileGrowth float64, n, value int64) {
-			metricGrowth, profileGrowth, p := measureDelta(t, func() {
+	testcase := func(strictTiming bool, acceptStacks [][]string, workers int, fn func() bool) func(t *testing.T) (metricGrowth float64, profileGrowth []int64, n, value int64, explain func()) {
+		return func(t *testing.T) (metricGrowth float64, profileGrowth []int64, n, value int64, explain func()) {
+			metricGrowth, totalProfileGrowth, p := measureDelta(t, func() {
 				var started, stopped sync.WaitGroup
 				started.Add(workers)
 				stopped.Add(workers)
@@ -1043,12 +1034,19 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 				stopped.Wait()
 			})
 
-			if profileGrowth == 0 {
+			if totalProfileGrowth == 0 {
 				t.Errorf("no increase in mutex profile")
 			}
 			if metricGrowth == 0 && strictTiming {
 				// If the critical section is very short, systems with low timer
 				// resolution may be unable to measure it via nanotime.
+				//
+				// This is sampled at 1 per gTrackingPeriod, but the explicit
+				// runtime.mutex tests create 200 contention events. Observing
+				// zero of those has a probability of (7/8)^200 = 2.5e-12 which
+				// is acceptably low (though the calculation has a tenuous
+				// dependency on cheaprandn being a good-enough source of
+				// entropy).
 				t.Errorf("no increase in /sync/mutex/wait/total:seconds metric")
 			}
 			// This comparison is possible because the time measurements in support of
@@ -1056,7 +1054,7 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 			// together. It doesn't work as well for user-space contention, where the
 			// involved goroutines are not _Grunnable the whole time and so need to pass
 			// through the scheduler.
-			t.Logf("lock contention growth in runtime/pprof's view  (%fs)", profileGrowth)
+			t.Logf("lock contention growth in runtime/pprof's view  (%fs)", totalProfileGrowth)
 			t.Logf("lock contention growth in runtime/metrics' view (%fs)", metricGrowth)
 
 			acceptStacks = append([][]string(nil), acceptStacks...)
@@ -1076,7 +1074,7 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 			}
 
 			var stks [][]string
-			values := make([][2]int64, len(acceptStacks))
+			values := make([][2]int64, len(acceptStacks)+1)
 			for _, s := range p.Sample {
 				var have []string
 				for _, loc := range s.Location {
@@ -1085,16 +1083,26 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 					}
 				}
 				stks = append(stks, have)
+				found := false
 				for i, stk := range acceptStacks {
 					if slices.Equal(have, stk) {
 						values[i][0] += s.Value[0]
 						values[i][1] += s.Value[1]
+						found = true
+						break
 					}
 				}
+				if !found {
+					values[len(values)-1][0] += s.Value[0]
+					values[len(values)-1][1] += s.Value[1]
+				}
 			}
+			profileGrowth = make([]int64, len(acceptStacks)+1)
+			profileGrowth[len(profileGrowth)-1] = values[len(values)-1][1]
 			for i, stk := range acceptStacks {
 				n += values[i][0]
 				value += values[i][1]
+				profileGrowth[i] = values[i][1]
 				t.Logf("stack %v has samples totaling n=%d value=%d", stk, values[i][0], values[i][1])
 			}
 			if n == 0 && value == 0 {
@@ -1107,18 +1115,15 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 				}
 			}
 
-			return metricGrowth, profileGrowth, n, value
+			return metricGrowth, profileGrowth, n, value, func() {
+				t.Logf("profile:\n%s", p)
+			}
 		}
 	}
 
 	name := t.Name()
 
 	t.Run("runtime.lock", func(t *testing.T) {
-		mus := make([]runtime.Mutex, 100)
-		var needContention atomic.Int64
-		delay := 100 * time.Microsecond // large relative to system noise, for comparison between clocks
-		delayMicros := delay.Microseconds()
-
 		// The goroutine that acquires the lock will only proceed when it
 		// detects that its partner is contended for the lock. That will lead to
 		// live-lock if anything (such as a STW) prevents the partner goroutine
@@ -1128,11 +1133,29 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 		// will end up contended twice. Instead, disable the GC.
 		defer debug.SetGCPercent(debug.SetGCPercent(-1))
 
-		const workers = 2
-		if runtime.GOMAXPROCS(0) < workers {
-			t.Skipf("contention on runtime-internal locks requires GOMAXPROCS >= %d", workers)
+		mus := make([]runtime.Mutex, 200)
+		var needContention atomic.Int64
+
+		baseDelay := 100 * time.Microsecond // large relative to system noise, for comparison between clocks
+		fastDelayMicros := baseDelay.Microseconds()
+		slowDelayMicros := baseDelay.Microseconds() * 4
+
+		const (
+			fastRole = iota
+			slowRole
+			workerCount
+		)
+		if runtime.GOMAXPROCS(0) < workerCount {
+			t.Skipf("contention on runtime-internal locks requires GOMAXPROCS >= %d", workerCount)
 		}
 
+		minTicks := make([][]int64, workerCount) // lower bound, known-contended time, measured by cputicks
+		maxTicks := make([][]int64, workerCount) // upper bound, total lock() duration, measured by cputicks
+		for i := range minTicks {
+			minTicks[i] = make([]int64, len(mus))
+			maxTicks[i] = make([]int64, len(mus))
+		}
+		var id atomic.Int32
 		fn := func() bool {
 			n := int(needContention.Load())
 			if n < 0 {
@@ -1140,58 +1163,180 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 			}
 			mu := &mus[n]
 
-			runtime.Lock(mu)
-			for int(needContention.Load()) == n {
-				if runtime.MutexContended(mu) {
-					// make them wait a little while
-					for start := runtime.Nanotime(); (runtime.Nanotime()-start)/1000 < delayMicros; {
-						runtime.Usleep(uint32(delayMicros))
-					}
-					break
-				}
+			// Each worker has a role: to have a fast or slow critical section.
+			// Rotate the role assignments as we step through the mutex slice so
+			// we don't end up with one M always claiming the same kind of work.
+			id := int(id.Add(1))
+			role := (id + n) % workerCount
+
+			marker, delayMicros := fastMarkerFrame, fastDelayMicros
+			if role == slowRole {
+				marker, delayMicros = slowMarkerFrame, slowDelayMicros
 			}
-			runtime.Unlock(mu)
-			needContention.Store(int64(n - 1))
+
+			// Each lock is used by two different critical sections, one fast
+			// and one slow, identified in profiles by their different "marker"
+			// functions. We expect the profile to blame each for the amount of
+			// delay it inflicts on other users of the lock. We run one worker
+			// of each kind, so any contention in one would be due to the other.
+			//
+			// We measure how long our runtime.lock call takes, which sets an
+			// upper bound on how much blame to expect for the other worker type
+			// in the profile. And if we acquire the lock first, we wait for the
+			// other worker to announce its contention. We measure the
+			// known-contended time, to use as a lower bound on how much blame
+			// we expect of ourselves in the profile. Then we stall for a little
+			// while (different amounts for "fast" versus "slow") before
+			// unlocking the mutex.
+
+			marker(func() {
+				t0 := runtime.Cputicks()
+				runtime.Lock(mu)
+				maxTicks[role][n] = runtime.Cputicks() - t0
+				minTicks[role][n] = 0
+				for int(needContention.Load()) == n {
+					if runtime.MutexContended(mu) {
+						t1 := runtime.Cputicks()
+						// make them wait a little while
+						for start := runtime.Nanotime(); (runtime.Nanotime()-start)/1000 < delayMicros; {
+							runtime.Usleep(uint32(1 + delayMicros/8))
+						}
+						minTicks[role][n] = runtime.Cputicks() - t1
+						break
+					}
+				}
+				runtime.Unlock(mu)
+				needContention.Store(int64(n - 1))
+			})
 
 			return true
 		}
 
-		stks := [][]string{{
-			"runtime.unlock",
-			"runtime_test." + name + ".func5.1",
-			"runtime_test.(*contentionWorker).run",
-		}}
+		stks := make([][]string, 2)
+		for i := range stks {
+			marker := "runtime_test.fastMarkerFrame"
+			if i == slowRole {
+				marker = "runtime_test.slowMarkerFrame"
+			}
+
+			stks[i] = []string{
+				"runtime.unlock",
+				"runtime_test." + name + ".func4.1.1",
+				marker,
+				"runtime_test." + name + ".func4.1",
+				"runtime_test.(*contentionWorker).run",
+			}
+		}
 
 		t.Run("sample-1", func(t *testing.T) {
 			old := runtime.SetMutexProfileFraction(1)
 			defer runtime.SetMutexProfileFraction(old)
 
 			needContention.Store(int64(len(mus) - 1))
-			metricGrowth, profileGrowth, n, _ := testcase(true, stks, workers, fn)(t)
+			metricGrowth, profileGrowth, n, _, explain := testcase(true, stks, workerCount, fn)(t)
+			defer func() {
+				if t.Failed() {
+					explain()
+				}
+			}()
 
-			if have, want := metricGrowth, delay.Seconds()*float64(len(mus)); have < want {
-				// The test imposes a delay with usleep, verified with calls to
-				// nanotime. Compare against the runtime/metrics package's view
-				// (based on nanotime) rather than runtime/pprof's view (based
-				// on cputicks).
-				t.Errorf("runtime/metrics reported less than the known minimum contention duration (%fs < %fs)", have, want)
-			}
+			t.Run("metric", func(t *testing.T) {
+				// The runtime/metrics view may be sampled at 1 per
+				// gTrackingPeriod, so we don't have a hard lower bound here.
+				testenv.SkipFlaky(t, 64253)
+
+				if have, want := metricGrowth, baseDelay.Seconds()*float64(len(mus)); have < want {
+					// The test imposes a delay with usleep, verified with calls to
+					// nanotime. Compare against the runtime/metrics package's view
+					// (based on nanotime) rather than runtime/pprof's view (based
+					// on cputicks).
+					t.Errorf("runtime/metrics reported less than the known minimum contention duration (%fs < %fs)", have, want)
+				}
+			})
 			if have, want := n, int64(len(mus)); have != want {
 				t.Errorf("mutex profile reported contention count different from the known true count (%d != %d)", have, want)
 			}
 
-			const slop = 1.5 // account for nanotime vs cputicks
-			if profileGrowth > slop*metricGrowth || metricGrowth > slop*profileGrowth {
-				t.Errorf("views differ by more than %fx", slop)
+			var slowMinTicks, fastMinTicks int64
+			for role, ticks := range minTicks {
+				for _, delta := range ticks {
+					if role == slowRole {
+						slowMinTicks += delta
+					} else {
+						fastMinTicks += delta
+					}
+				}
 			}
+			var slowMaxTicks, fastMaxTicks int64
+			for role, ticks := range maxTicks {
+				for _, delta := range ticks {
+					if role == slowRole {
+						slowMaxTicks += delta
+					} else {
+						fastMaxTicks += delta
+					}
+				}
+			}
+
+			cpuGHz := float64(runtime.CyclesPerSecond()) / 1e9
+			for _, set := range []struct {
+				name     string
+				profTime int64
+				minTime  int64
+				maxTime  int64
+			}{
+				{
+					name:     "slow",
+					profTime: profileGrowth[slowRole],
+					minTime:  int64(float64(slowMinTicks) / cpuGHz),
+					maxTime:  int64(float64(fastMaxTicks) / cpuGHz),
+				},
+				{
+					name:     "fast",
+					profTime: profileGrowth[fastRole],
+					minTime:  int64(float64(fastMinTicks) / cpuGHz),
+					maxTime:  int64(float64(slowMaxTicks) / cpuGHz),
+				},
+			} {
+				t.Logf("profile's view of delays due to %q critical section:                 %dns", set.name, set.profTime)
+				t.Logf("test's view of known-contended time within %q critical section:      %dns", set.name, set.minTime)
+				t.Logf("test's view of lock duration before critical sections other than %q: %dns", set.name, set.maxTime)
+
+				if set.profTime < set.minTime {
+					t.Errorf("profile undercounted %q critical section", set.name)
+				}
+				if set.profTime > set.maxTime {
+					t.Errorf("profile overcounted %q critical section", set.name)
+				}
+			}
+
+			var totalProfileGrowth float64
+			for _, growth := range profileGrowth {
+				totalProfileGrowth += float64(growth) * time.Nanosecond.Seconds()
+			}
+
+			const slop = 1.5 // account for nanotime vs cputicks
+			t.Run("compare timers", func(t *testing.T) {
+				testenv.SkipFlaky(t, 64253)
+				if totalProfileGrowth > slop*metricGrowth || metricGrowth > slop*totalProfileGrowth {
+					t.Errorf("views differ by more than %fx", slop)
+				}
+			})
 		})
 
 		t.Run("sample-2", func(t *testing.T) {
+			testenv.SkipFlaky(t, 64253)
+
 			old := runtime.SetMutexProfileFraction(2)
 			defer runtime.SetMutexProfileFraction(old)
 
 			needContention.Store(int64(len(mus) - 1))
-			metricGrowth, profileGrowth, n, _ := testcase(true, stks, workers, fn)(t)
+			metricGrowth, profileGrowth, n, _, explain := testcase(true, stks, workerCount, fn)(t)
+			defer func() {
+				if t.Failed() {
+					explain()
+				}
+			}()
 
 			// With 100 trials and profile fraction of 2, we expect to capture
 			// 50 samples. Allow the test to pass if we get at least 20 samples;
@@ -1199,7 +1344,7 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 			// 1e-9 chance of that, which is an acceptably low flakiness rate.
 			const samplingSlop = 2.5
 
-			if have, want := metricGrowth, delay.Seconds()*float64(len(mus)); samplingSlop*have < want {
+			if have, want := metricGrowth, baseDelay.Seconds()*float64(len(mus)); samplingSlop*have < want {
 				// The test imposes a delay with usleep, verified with calls to
 				// nanotime. Compare against the runtime/metrics package's view
 				// (based on nanotime) rather than runtime/pprof's view (based
@@ -1210,14 +1355,21 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 				t.Errorf("mutex profile reported contention count too different from the expected count (%d far from %d)", have, want)
 			}
 
+			var totalProfileGrowth float64
+			for _, growth := range profileGrowth {
+				totalProfileGrowth += float64(growth) * time.Nanosecond.Seconds()
+			}
+
 			const timerSlop = 1.5 * samplingSlop // account for nanotime vs cputicks, plus the two views' independent sampling
-			if profileGrowth > timerSlop*metricGrowth || metricGrowth > timerSlop*profileGrowth {
+			if totalProfileGrowth > timerSlop*metricGrowth || metricGrowth > timerSlop*totalProfileGrowth {
 				t.Errorf("views differ by more than %fx", timerSlop)
 			}
 		})
 	})
 
 	t.Run("runtime.semrelease", func(t *testing.T) {
+		testenv.SkipFlaky(t, 64253)
+
 		old := runtime.SetMutexProfileFraction(1)
 		defer runtime.SetMutexProfileFraction(old)
 
@@ -1251,14 +1403,14 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 			{
 				"runtime.unlock",
 				"runtime.semrelease1",
-				"runtime_test.TestRuntimeLockMetricsAndProfile.func6.1",
+				"runtime_test.TestRuntimeLockMetricsAndProfile.func5.1",
 				"runtime_test.(*contentionWorker).run",
 			},
 			{
 				"runtime.unlock",
 				"runtime.semacquire1",
 				"runtime.semacquire",
-				"runtime_test.TestRuntimeLockMetricsAndProfile.func6.1",
+				"runtime_test.TestRuntimeLockMetricsAndProfile.func5.1",
 				"runtime_test.(*contentionWorker).run",
 			},
 		}
@@ -1276,6 +1428,9 @@ func TestRuntimeLockMetricsAndProfile(t *testing.T) {
 	})
 }
 
+func slowMarkerFrame(fn func()) { fn() }
+func fastMarkerFrame(fn func()) { fn() }
+
 // contentionWorker provides cleaner call stacks for lock contention profile tests
 type contentionWorker struct {
 	before func()
@@ -1288,5 +1443,144 @@ func (w *contentionWorker) run() {
 	w.before()
 
 	for w.fn() {
+	}
+}
+
+func TestCPUStats(t *testing.T) {
+	// Run a few GC cycles to get some of the stats to be non-zero.
+	runtime.GC()
+	runtime.GC()
+	runtime.GC()
+
+	// Set GOMAXPROCS high then sleep briefly to ensure we generate
+	// some idle time.
+	oldmaxprocs := runtime.GOMAXPROCS(10)
+	time.Sleep(time.Millisecond)
+	runtime.GOMAXPROCS(oldmaxprocs)
+
+	stats := runtime.ReadCPUStats()
+	gcTotal := stats.GCAssistTime + stats.GCDedicatedTime + stats.GCIdleTime + stats.GCPauseTime
+	if gcTotal != stats.GCTotalTime {
+		t.Errorf("manually computed total does not match GCTotalTime: %d cpu-ns vs. %d cpu-ns", gcTotal, stats.GCTotalTime)
+	}
+	scavTotal := stats.ScavengeAssistTime + stats.ScavengeBgTime
+	if scavTotal != stats.ScavengeTotalTime {
+		t.Errorf("manually computed total does not match ScavengeTotalTime: %d cpu-ns vs. %d cpu-ns", scavTotal, stats.ScavengeTotalTime)
+	}
+	total := gcTotal + scavTotal + stats.IdleTime + stats.UserTime
+	if total != stats.TotalTime {
+		t.Errorf("manually computed overall total does not match TotalTime: %d cpu-ns vs. %d cpu-ns", total, stats.TotalTime)
+	}
+	if total == 0 {
+		t.Error("total time is zero")
+	}
+	if gcTotal == 0 {
+		t.Error("GC total time is zero")
+	}
+	if stats.IdleTime == 0 {
+		t.Error("idle time is zero")
+	}
+}
+
+func TestMetricHeapUnusedLargeObjectOverflow(t *testing.T) {
+	// This test makes sure /memory/classes/heap/unused:bytes
+	// doesn't overflow when allocating and deallocating large
+	// objects. It is a regression test for #67019.
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			for range 10 {
+				abi.Escape(make([]byte, 1<<20))
+			}
+			runtime.GC()
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}()
+	s := []metrics.Sample{
+		{Name: "/memory/classes/heap/unused:bytes"},
+	}
+	for range 1000 {
+		metrics.Read(s)
+		if s[0].Value.Uint64() > 1<<40 {
+			t.Errorf("overflow")
+			break
+		}
+	}
+	done <- struct{}{}
+	wg.Wait()
+}
+
+func TestReadMetricsCleanups(t *testing.T) {
+	runtime.GC()                                                // End any in-progress GC.
+	runtime.BlockUntilEmptyCleanupQueue(int64(1 * time.Second)) // Flush any queued cleanups.
+
+	var before [2]metrics.Sample
+	before[0].Name = "/gc/cleanups/queued:cleanups"
+	before[1].Name = "/gc/cleanups/executed:cleanups"
+	after := before
+
+	metrics.Read(before[:])
+
+	const N = 10
+	for i := 0; i < N; i++ {
+		runtime.AddCleanup(new(*int), func(_ struct{}) {}, struct{}{})
+	}
+
+	runtime.GC()
+	runtime.BlockUntilEmptyCleanupQueue(int64(1 * time.Second))
+
+	metrics.Read(after[:])
+
+	if v0, v1 := before[0].Value.Uint64(), after[0].Value.Uint64(); v0+N != v1 {
+		t.Errorf("expected %s difference to be exactly %d, got %d -> %d", before[0].Name, N, v0, v1)
+	}
+	if v0, v1 := before[1].Value.Uint64(), after[1].Value.Uint64(); v0+N != v1 {
+		t.Errorf("expected %s difference to be exactly %d, got %d -> %d", before[1].Name, N, v0, v1)
+	}
+}
+
+func TestReadMetricsFinalizers(t *testing.T) {
+	runtime.GC()                                                  // End any in-progress GC.
+	runtime.BlockUntilEmptyFinalizerQueue(int64(1 * time.Second)) // Flush any queued finalizers.
+
+	var before [2]metrics.Sample
+	before[0].Name = "/gc/finalizers/queued:finalizers"
+	before[1].Name = "/gc/finalizers/executed:finalizers"
+	after := before
+
+	metrics.Read(before[:])
+
+	const N = 10
+	for i := 0; i < N; i++ {
+		runtime.SetFinalizer(new(*int), func(_ **int) {})
+	}
+
+	runtime.GC()
+	runtime.GC()
+	runtime.BlockUntilEmptyFinalizerQueue(int64(1 * time.Second))
+
+	metrics.Read(after[:])
+
+	if v0, v1 := before[0].Value.Uint64(), after[0].Value.Uint64(); v0+N != v1 {
+		t.Errorf("expected %s difference to be exactly %d, got %d -> %d", before[0].Name, N, v0, v1)
+	}
+	if v0, v1 := before[1].Value.Uint64(), after[1].Value.Uint64(); v0+N != v1 {
+		t.Errorf("expected %s difference to be exactly %d, got %d -> %d", before[1].Name, N, v0, v1)
+	}
+}
+
+func TestReadMetricsSched(t *testing.T) {
+	// This test is run in a subprocess to prevent other tests from polluting the metrics.
+	output := runTestProg(t, "testprog", "SchedMetrics")
+	want := "OK\n"
+	if output != want {
+		t.Fatalf("output:\n%s\n\nwanted:\n%s", output, want)
 	}
 }

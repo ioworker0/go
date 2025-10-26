@@ -29,12 +29,16 @@ const (
 
 // event is the JSON struct we emit.
 type event struct {
-	Time    *time.Time `json:",omitempty"`
-	Action  string
-	Package string     `json:",omitempty"`
-	Test    string     `json:",omitempty"`
-	Elapsed *float64   `json:",omitempty"`
-	Output  *textBytes `json:",omitempty"`
+	Time        *time.Time `json:",omitempty"`
+	Action      string
+	Package     string     `json:",omitempty"`
+	Test        string     `json:",omitempty"`
+	Elapsed     *float64   `json:",omitempty"`
+	Output      *textBytes `json:",omitempty"`
+	FailedBuild string     `json:",omitempty"`
+	Key         string     `json:",omitempty"`
+	Value       string     `json:",omitempty"`
+	Path        string     `json:",omitempty"`
 }
 
 // textBytes is a hack to get JSON to emit a []byte as a string
@@ -59,6 +63,10 @@ type Converter struct {
 	input      lineBuffer // input buffer
 	output     lineBuffer // output buffer
 	needMarker bool       // require ^V marker to introduce test framing line
+
+	// failedBuild is set to the package ID of the cause of a build failure,
+	// if that's what caused this test to fail.
+	failedBuild string
 }
 
 // inBuffer and outBuffer are the input and output buffer sizes.
@@ -140,6 +148,13 @@ func (c *Converter) Exited(err error) {
 	}
 }
 
+// SetFailedBuild sets the package ID that is the root cause of a build failure
+// for this test. This will be reported in the final "fail" event's FailedBuild
+// field.
+func (c *Converter) SetFailedBuild(pkgID string) {
+	c.failedBuild = pkgID
+}
+
 const marker = byte(0x16) // ^V
 
 var (
@@ -165,6 +180,8 @@ var (
 		[]byte("=== PASS  "),
 		[]byte("=== FAIL  "),
 		[]byte("=== SKIP  "),
+		[]byte("=== ATTR  "),
+		[]byte("=== ARTIFACTS "),
 	}
 
 	reports = [][]byte{
@@ -236,7 +253,6 @@ func (c *Converter) handleInputLine(line []byte) {
 	// "=== RUN   "
 	// "=== PAUSE "
 	// "=== CONT  "
-	actionColon := false
 	origLine := line
 	ok := false
 	indent := 0
@@ -258,7 +274,6 @@ func (c *Converter) handleInputLine(line []byte) {
 		}
 		for _, magic := range reports {
 			if bytes.HasPrefix(line, magic) {
-				actionColon = true
 				ok = true
 				break
 			}
@@ -281,16 +296,11 @@ func (c *Converter) handleInputLine(line []byte) {
 		return
 	}
 
-	// Parse out action and test name.
-	i := 0
-	if actionColon {
-		i = bytes.IndexByte(line, ':') + 1
-	}
-	if i == 0 {
-		i = len(updates[0])
-	}
-	action := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(string(line[4:i])), ":"))
-	name := strings.TrimSpace(string(line[i:]))
+	// Parse out action and test name from "=== ACTION: Name".
+	action, name, _ := strings.Cut(string(line[len("=== "):]), " ")
+	action = strings.TrimSuffix(action, ":")
+	action = strings.ToLower(action)
+	name = strings.TrimSpace(name)
 
 	e := &event{Action: action}
 	if line[0] == '-' { // PASS or FAIL report
@@ -320,6 +330,14 @@ func (c *Converter) handleInputLine(line []byte) {
 		c.report = append(c.report, e)
 		c.output.write(origLine)
 		return
+	}
+	switch action {
+	case "artifacts":
+		name, e.Path, _ = strings.Cut(name, " ")
+	case "attr":
+		var rest string
+		name, rest, _ = strings.Cut(name, " ")
+		e.Key, e.Value, _ = strings.Cut(rest, " ")
 	}
 	// === update.
 	// Finish any pending PASS/FAIL reports.
@@ -368,6 +386,9 @@ func (c *Converter) Close() error {
 		if c.mode&Timestamp != 0 {
 			dt := time.Since(c.start).Round(1 * time.Millisecond).Seconds()
 			e.Elapsed = &dt
+		}
+		if c.result == "fail" {
+			e.FailedBuild = c.failedBuild
 		}
 		c.writeEvent(e)
 	}

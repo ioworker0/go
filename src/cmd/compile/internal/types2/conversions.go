@@ -18,7 +18,7 @@ func (check *Checker) conversion(x *operand, T Type) {
 	constArg := x.mode == constant_
 
 	constConvertibleTo := func(T Type, val *constant.Value) bool {
-		switch t, _ := under(T).(*Basic); {
+		switch t, _ := T.Underlying().(*Basic); {
 		case t == nil:
 			// nothing to do
 		case representableConst(x.val, check, t, val):
@@ -56,7 +56,7 @@ func (check *Checker) conversion(x *operand, T Type) {
 		// If T's type set is empty, or if it doesn't
 		// have specific types, constant x cannot be
 		// converted.
-		ok = T.(*TypeParam).underIs(func(u Type) bool {
+		ok = underIs(T, func(u Type) bool {
 			// u is nil if there are no specific type terms
 			if u == nil {
 				cause = check.sprintf("%s does not contain specific types", T)
@@ -139,13 +139,16 @@ func (x *operand) convertibleTo(check *Checker, T Type, cause *string) bool {
 		return true
 	}
 
-	// "V and T have identical underlying types if tags are ignored
-	// and V and T are not type parameters"
-	V := x.typ
-	Vu := under(V)
-	Tu := under(T)
+	origT := T
+	V := Unalias(x.typ)
+	T = Unalias(T)
+	Vu := V.Underlying()
+	Tu := T.Underlying()
 	Vp, _ := V.(*TypeParam)
 	Tp, _ := T.(*TypeParam)
+
+	// "V and T have identical underlying types if tags are ignored
+	// and V and T are not type parameters"
 	if IdenticalIgnoreTags(Vu, Tu) && Vp == nil && Tp == nil {
 		return true
 	}
@@ -155,7 +158,7 @@ func (x *operand) convertibleTo(check *Checker, T Type, cause *string) bool {
 	// and their pointer base types are not type parameters"
 	if V, ok := V.(*Pointer); ok {
 		if T, ok := T.(*Pointer); ok {
-			if IdenticalIgnoreTags(under(V.base), under(T.base)) && !isTypeParam(V.base) && !isTypeParam(T.base) {
+			if IdenticalIgnoreTags(V.base.Underlying(), T.base.Underlying()) && !isTypeParam(V.base) && !isTypeParam(T.base) {
 				return true
 			}
 		}
@@ -197,7 +200,7 @@ func (x *operand) convertibleTo(check *Checker, T Type, cause *string) bool {
 		switch a := Tu.(type) {
 		case *Array:
 			if Identical(s.Elem(), a.Elem()) {
-				if check == nil || check.allowVersion(x, go1_20) {
+				if check == nil || check.allowVersion(go1_20) {
 					return true
 				}
 				// check != nil
@@ -208,9 +211,9 @@ func (x *operand) convertibleTo(check *Checker, T Type, cause *string) bool {
 				return false
 			}
 		case *Pointer:
-			if a, _ := under(a.Elem()).(*Array); a != nil {
+			if a, _ := a.Elem().Underlying().(*Array); a != nil {
 				if Identical(s.Elem(), a.Elem()) {
-					if check == nil || check.allowVersion(x, go1_17) {
+					if check == nil || check.allowVersion(go1_17) {
 						return true
 					}
 					// check != nil
@@ -267,7 +270,7 @@ func (x *operand) convertibleTo(check *Checker, T Type, cause *string) bool {
 			}
 			x.typ = V.typ
 			if !x.convertibleTo(check, T, cause) {
-				errorf("cannot convert %s (in %s) to type %s", V.typ, Vp, T)
+				errorf("cannot convert %s (in %s) to type %s", V.typ, Vp, origT)
 				return false
 			}
 			return true
@@ -289,23 +292,23 @@ func (x *operand) convertibleTo(check *Checker, T Type, cause *string) bool {
 }
 
 func isUintptr(typ Type) bool {
-	t, _ := under(typ).(*Basic)
+	t, _ := typ.Underlying().(*Basic)
 	return t != nil && t.kind == Uintptr
 }
 
 func isUnsafePointer(typ Type) bool {
-	t, _ := under(typ).(*Basic)
+	t, _ := typ.Underlying().(*Basic)
 	return t != nil && t.kind == UnsafePointer
 }
 
 func isPointer(typ Type) bool {
-	_, ok := under(typ).(*Pointer)
+	_, ok := typ.Underlying().(*Pointer)
 	return ok
 }
 
 func isBytesOrRunes(typ Type) bool {
-	if s, _ := under(typ).(*Slice); s != nil {
-		t, _ := under(s.elem).(*Basic)
+	if s, _ := typ.Underlying().(*Slice); s != nil {
+		t, _ := s.elem.Underlying().(*Basic)
 		return t != nil && (t.kind == Byte || t.kind == Rune)
 	}
 	return false

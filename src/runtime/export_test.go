@@ -9,10 +9,10 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
-	"internal/goexperiment"
 	"internal/goos"
-	"runtime/internal/atomic"
-	"runtime/internal/sys"
+	"internal/runtime/atomic"
+	"internal/runtime/gc"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -35,11 +35,11 @@ var ReadRandomFailed = &readRandomFailed
 
 var Fastlog2 = fastlog2
 
-var Atoi = atoi
-var Atoi32 = atoi32
 var ParseByteCount = parseByteCount
 
 var Nanotime = nanotime
+var Cputicks = cputicks
+var CyclesPerSecond = pprof_cyclesPerSecond
 var NetpollBreak = netpollBreak
 var Usleep = usleep
 
@@ -57,9 +57,6 @@ const CrashStackImplemented = crashStackImplemented
 
 const TracebackInnerFrames = tracebackInnerFrames
 const TracebackOuterFrames = tracebackOuterFrames
-
-var MapKeys = keys
-var MapValues = values
 
 var LockPartialOrder = lockPartialOrder
 
@@ -95,9 +92,9 @@ func Netpoll(delta int64) {
 	})
 }
 
-func GCMask(x any) (ret []byte) {
+func PointerMask(x any) (ret []byte) {
 	systemstack(func() {
-		ret = getgcmask(x)
+		ret = pointerMask(x)
 	})
 	return
 }
@@ -239,138 +236,6 @@ var Write = write
 func Envs() []string     { return envs }
 func SetEnvs(e []string) { envs = e }
 
-// For benchmarking.
-
-// blockWrapper is a wrapper type that ensures a T is placed within a
-// large object. This is necessary for safely benchmarking things
-// that manipulate the heap bitmap, like heapBitsSetType.
-//
-// More specifically, allocating threads assume they're the sole writers
-// to their span's heap bits, which allows those writes to be non-atomic.
-// The heap bitmap is written byte-wise, so if one tried to call heapBitsSetType
-// on an existing object in a small object span, we might corrupt that
-// span's bitmap with a concurrent byte write to the heap bitmap. Large
-// object spans contain exactly one object, so we can be sure no other P
-// is going to be allocating from it concurrently, hence this wrapper type
-// which ensures we have a T in a large object span.
-type blockWrapper[T any] struct {
-	value T
-	_     [_MaxSmallSize]byte // Ensure we're a large object.
-}
-
-func BenchSetType[T any](n int, resetTimer func()) {
-	x := new(blockWrapper[T])
-
-	// Escape x to ensure it is allocated on the heap, as we are
-	// working on the heap bits here.
-	Escape(x)
-
-	// Grab the type.
-	var i any = *new(T)
-	e := *efaceOf(&i)
-	t := e._type
-
-	// Benchmark setting the type bits for just the internal T of the block.
-	benchSetType(n, resetTimer, 1, unsafe.Pointer(&x.value), t)
-}
-
-const maxArrayBlockWrapperLen = 32
-
-// arrayBlockWrapper is like blockWrapper, but the interior value is intended
-// to be used as a backing store for a slice.
-type arrayBlockWrapper[T any] struct {
-	value [maxArrayBlockWrapperLen]T
-	_     [_MaxSmallSize]byte // Ensure we're a large object.
-}
-
-// arrayLargeBlockWrapper is like arrayBlockWrapper, but the interior array
-// accommodates many more elements.
-type arrayLargeBlockWrapper[T any] struct {
-	value [1024]T
-	_     [_MaxSmallSize]byte // Ensure we're a large object.
-}
-
-func BenchSetTypeSlice[T any](n int, resetTimer func(), len int) {
-	// We have two separate cases here because we want to avoid
-	// tests on big types but relatively small slices to avoid generating
-	// an allocation that's really big. This will likely force a GC which will
-	// skew the test results.
-	var y unsafe.Pointer
-	if len <= maxArrayBlockWrapperLen {
-		x := new(arrayBlockWrapper[T])
-		// Escape x to ensure it is allocated on the heap, as we are
-		// working on the heap bits here.
-		Escape(x)
-		y = unsafe.Pointer(&x.value[0])
-	} else {
-		x := new(arrayLargeBlockWrapper[T])
-		Escape(x)
-		y = unsafe.Pointer(&x.value[0])
-	}
-
-	// Grab the type.
-	var i any = *new(T)
-	e := *efaceOf(&i)
-	t := e._type
-
-	// Benchmark setting the type for a slice created from the array
-	// of T within the arrayBlock.
-	benchSetType(n, resetTimer, len, y, t)
-}
-
-// benchSetType is the implementation of the BenchSetType* functions.
-// x must be len consecutive Ts allocated within a large object span (to
-// avoid a race on the heap bitmap).
-//
-// Note: this function cannot be generic. It would get its type from one of
-// its callers (BenchSetType or BenchSetTypeSlice) whose type parameters are
-// set by a call in the runtime_test package. That means this function and its
-// callers will get instantiated in the package that provides the type argument,
-// i.e. runtime_test. However, we call a function on the system stack. In race
-// mode the runtime package is usually left uninstrumented because e.g. g0 has
-// no valid racectx, but if we're instantiated in the runtime_test package,
-// we might accidentally cause runtime code to be incorrectly instrumented.
-func benchSetType(n int, resetTimer func(), len int, x unsafe.Pointer, t *_type) {
-	// This benchmark doesn't work with the allocheaders experiment. It sets up
-	// an elaborate scenario to be able to benchmark the function safely, but doing
-	// this work for the allocheaders' version of the function would be complex.
-	// Just fail instead and rely on the test code making sure we never get here.
-	if goexperiment.AllocHeaders {
-		panic("called benchSetType with allocheaders experiment enabled")
-	}
-
-	// Compute the input sizes.
-	size := t.Size() * uintptr(len)
-
-	// Validate this function's invariant.
-	s := spanOfHeap(uintptr(x))
-	if s == nil {
-		panic("no heap span for input")
-	}
-	if s.spanclass.sizeclass() != 0 {
-		panic("span is not a large object span")
-	}
-
-	// Round up the size to the size class to make the benchmark a little more
-	// realistic. However, validate it, to make sure this is safe.
-	allocSize := roundupsize(size, !t.Pointers())
-	if s.npages*pageSize < allocSize {
-		panic("backing span not large enough for benchmark")
-	}
-
-	// Benchmark heapBitsSetType by calling it in a loop. This is safe because
-	// x is in a large object span.
-	resetTimer()
-	systemstack(func() {
-		for i := 0; i < n; i++ {
-			heapBitsSetType(uintptr(x), allocSize, size, t)
-		}
-	})
-
-	// Make sure x doesn't get freed, since we're taking a uintptr.
-	KeepAlive(x)
-}
-
 const PtrSize = goarch.PtrSize
 
 var ForceGCPeriod = &forcegcperiod
@@ -427,6 +292,12 @@ func (p *ProfBuf) Read(mode profBufReadMode) ([]uint64, []unsafe.Pointer, bool) 
 
 func (p *ProfBuf) Close() {
 	(*profBuf)(p).close()
+}
+
+type CPUStats = cpuStats
+
+func ReadCPUStats() CPUStats {
+	return work.cpuStats
 }
 
 func ReadMetricsSlow(memStats *MemStats, samplesp unsafe.Pointer, len, cap int) {
@@ -490,7 +361,7 @@ func ReadMemStatsSlow() (base, slow MemStats) {
 		slow.Mallocs = 0
 		slow.Frees = 0
 		slow.HeapReleased = 0
-		var bySize [_NumSizeClasses]struct {
+		var bySize [gc.NumSizeClasses]struct {
 			Mallocs, Frees uint64
 		}
 
@@ -518,11 +389,11 @@ func ReadMemStatsSlow() (base, slow MemStats) {
 
 		// Collect per-sizeclass free stats.
 		var smallFree uint64
-		for i := 0; i < _NumSizeClasses; i++ {
+		for i := 0; i < gc.NumSizeClasses; i++ {
 			slow.Frees += m.smallFreeCount[i]
 			bySize[i].Frees += m.smallFreeCount[i]
 			bySize[i].Mallocs += m.smallFreeCount[i]
-			smallFree += m.smallFreeCount[i] * uint64(class_to_size[i])
+			smallFree += m.smallFreeCount[i] * uint64(gc.SizeClassToSize[i])
 		}
 		slow.Frees += m.tinyAllocCount + m.largeFreeCount
 		slow.Mallocs += slow.Frees
@@ -543,7 +414,8 @@ func ReadMemStatsSlow() (base, slow MemStats) {
 			slow.HeapReleased += uint64(pg) * pageSize
 		}
 		for _, p := range allp {
-			pg := sys.OnesCount64(p.pcache.scav)
+			// Only count scav bits for pages in the cache
+			pg := sys.OnesCount64(p.pcache.cache & p.pcache.scav)
 			slow.HeapReleased += uint64(pg) * pageSize
 		}
 
@@ -608,22 +480,6 @@ func (rw *RWMutex) Unlock() {
 	rw.rw.unlock()
 }
 
-const RuntimeHmapSize = unsafe.Sizeof(hmap{})
-
-func MapBucketsCount(m map[int]int) int {
-	h := *(**hmap)(unsafe.Pointer(&m))
-	return 1 << h.B
-}
-
-func MapBucketsPointerIsNil(m map[int]int) bool {
-	h := *(**hmap)(unsafe.Pointer(&m))
-	return h.buckets == nil
-}
-
-func OverLoadFactor(count int, B uint8) bool {
-	return overLoadFactor(count, B)
-}
-
 func LockOSCounts() (external, internal uint32) {
 	gp := getg()
 	if gp.m.lockedExt+gp.m.lockedInt == 0 {
@@ -641,7 +497,7 @@ func LockOSCounts() (external, internal uint32) {
 //go:noinline
 func TracebackSystemstack(stk []uintptr, i int) int {
 	if i == 0 {
-		pc, sp := getcallerpc(), getcallersp()
+		pc, sp := sys.GetCallerPC(), sys.GetCallerSP()
 		var u unwinder
 		u.initAt(pc, sp, 0, getg(), unwindJumpStack) // Don't ignore errors, for testing
 		return tracebackPCs(&u, 0, stk)
@@ -679,7 +535,7 @@ func MapNextArenaHint() (start, end uintptr, ok bool) {
 	} else {
 		start, end = addr, addr+heapArenaBytes
 	}
-	got := sysReserve(unsafe.Pointer(addr), physPageSize)
+	got := sysReserve(unsafe.Pointer(addr), physPageSize, "")
 	ok = (addr == uintptr(got))
 	if !ok {
 		// We were unable to get the requested reservation.
@@ -696,6 +552,8 @@ func GetNextArenaHint() uintptr {
 type G = g
 
 type Sudog = sudog
+
+type XRegPerG = xRegPerG
 
 func Getg() *G {
 	return getg()
@@ -724,7 +582,7 @@ func unexportedPanicForTesting(b []byte, i int) byte {
 func G0StackOverflow() {
 	systemstack(func() {
 		g0 := getg()
-		sp := getcallersp()
+		sp := sys.GetCallerSP()
 		// The stack bounds for g0 stack is not always precise.
 		// Use an artificially small stack, to trigger a stack overflow
 		// without actually run out of the system stack (which may seg fault).
@@ -739,42 +597,6 @@ func G0StackOverflow() {
 func stackOverflow(x *byte) {
 	var buf [256]byte
 	stackOverflow(&buf[0])
-}
-
-func MapTombstoneCheck(m map[int]int) {
-	// Make sure emptyOne and emptyRest are distributed correctly.
-	// We should have a series of filled and emptyOne cells, followed by
-	// a series of emptyRest cells.
-	h := *(**hmap)(unsafe.Pointer(&m))
-	i := any(m)
-	t := *(**maptype)(unsafe.Pointer(&i))
-
-	for x := 0; x < 1<<h.B; x++ {
-		b0 := (*bmap)(add(h.buckets, uintptr(x)*uintptr(t.BucketSize)))
-		n := 0
-		for b := b0; b != nil; b = b.overflow(t) {
-			for i := 0; i < abi.MapBucketCount; i++ {
-				if b.tophash[i] != emptyRest {
-					n++
-				}
-			}
-		}
-		k := 0
-		for b := b0; b != nil; b = b.overflow(t) {
-			for i := 0; i < abi.MapBucketCount; i++ {
-				if k < n && b.tophash[i] == emptyRest {
-					panic("early emptyRest")
-				}
-				if k >= n && b.tophash[i] != emptyRest {
-					panic("late non-emptyRest")
-				}
-				if k == n-1 && b.tophash[i] == emptyOne {
-					panic("last non-emptyRest entry is emptyOne")
-				}
-				k++
-			}
-		}
-	}
 }
 
 func RunGetgThreadSwitchTest() {
@@ -1298,12 +1120,14 @@ func CheckScavengedBitsCleared(mismatches []BitsMismatch) (n int, ok bool) {
 
 		// Lock so that we can safely access the bitmap.
 		lock(&mheap_.lock)
+
 	chunkLoop:
 		for i := mheap_.pages.start; i < mheap_.pages.end; i++ {
 			chunk := mheap_.pages.tryChunkOf(i)
 			if chunk == nil {
 				continue
 			}
+			cb := chunkBase(i)
 			for j := 0; j < pallocChunkPages/64; j++ {
 				// Run over each 64-bit bitmap section and ensure
 				// scavenged is being cleared properly on allocation.
@@ -1318,7 +1142,7 @@ func CheckScavengedBitsCleared(mismatches []BitsMismatch) (n int, ok bool) {
 						break chunkLoop
 					}
 					mismatches[n] = BitsMismatch{
-						Base: chunkBase(i) + uintptr(j)*64*pageSize,
+						Base: cb + uintptr(j)*64*pageSize,
 						Got:  got,
 						Want: want,
 					}
@@ -1330,6 +1154,37 @@ func CheckScavengedBitsCleared(mismatches []BitsMismatch) (n int, ok bool) {
 
 		getg().m.mallocing--
 	})
+
+	if randomizeHeapBase && len(mismatches) > 0 {
+		// When goexperiment.RandomizedHeapBase64 is set we use a series of
+		// padding pages to generate randomized heap base address which have
+		// both the alloc and scav bits set. Because of this we expect exactly
+		// one arena will have mismatches, so check for that explicitly and
+		// remove the mismatches if that property holds. If we see more than one
+		// arena with this property, that is an indication something has
+		// actually gone wrong, so return the mismatches.
+		//
+		// We do this, instead of ignoring the mismatches in the chunkLoop, because
+		// it's not easy to determine which arena we added the padding pages to
+		// programmatically, without explicitly recording the base address somewhere
+		// in a global variable (which we'd rather not do as the address of that variable
+		// is likely to be somewhat predictable, potentially defeating the purpose
+		// of our randomization).
+		affectedArenas := map[arenaIdx]bool{}
+		for _, mismatch := range mismatches {
+			if mismatch.Base > 0 {
+				affectedArenas[arenaIndex(mismatch.Base)] = true
+			}
+		}
+		if len(affectedArenas) == 1 {
+			ok = true
+			// zero the mismatches
+			for i := range n {
+				mismatches[i] = BitsMismatch{}
+			}
+		}
+	}
+
 	return
 }
 
@@ -1349,6 +1204,9 @@ func PageCachePagesLeaked() (leaked uintptr) {
 	startTheWorld(stw)
 	return
 }
+
+var ProcYield = procyield
+var OSYield = osyield
 
 type Mutex = mutex
 
@@ -1407,6 +1265,7 @@ func AllocMSpan() *MSpan {
 	systemstack(func() {
 		lock(&mheap_.lock)
 		s = (*mspan)(mheap_.spanalloc.alloc())
+		s.init(0, 0)
 		unlock(&mheap_.lock)
 	})
 	return (*MSpan)(s)
@@ -1440,7 +1299,7 @@ const (
 
 type TimeHistogram timeHistogram
 
-// Counts returns the counts for the given bucket, subBucket indices.
+// Count returns the counts for the given bucket, subBucket indices.
 // Returns true if the bucket was valid, otherwise returns the counts
 // for the overflow bucket if bucket > 0 or the underflow bucket if
 // bucket < 0, and false.
@@ -1909,7 +1768,7 @@ func NewUserArena() *UserArena {
 func (a *UserArena) New(out *any) {
 	i := efaceOf(out)
 	typ := i._type
-	if typ.Kind_&kindMask != kindPtr {
+	if typ.Kind() != abi.Pointer {
 		panic("new result of non-ptr type")
 	}
 	typ = (*ptrtype)(unsafe.Pointer(typ)).Elem
@@ -1946,15 +1805,21 @@ func BlockUntilEmptyFinalizerQueue(timeout int64) bool {
 	return blockUntilEmptyFinalizerQueue(timeout)
 }
 
+func BlockUntilEmptyCleanupQueue(timeout int64) bool {
+	return gcCleanups.blockUntilEmpty(timeout)
+}
+
 func FrameStartLine(f *Frame) int {
 	return f.startLine
 }
 
 // PersistentAlloc allocates some memory that lives outside the Go heap.
 // This memory will never be freed; use sparingly.
-func PersistentAlloc(n uintptr) unsafe.Pointer {
-	return persistentalloc(n, 0, &memstats.other_sys)
+func PersistentAlloc(n, align uintptr) unsafe.Pointer {
+	return persistentalloc(n, align, &memstats.other_sys)
 }
+
+const TagAlign = tagAlign
 
 // FPCallers works like Callers and uses frame pointer unwinding to populate
 // pcBuf with the return addresses of the physical frames on the stack.
@@ -2001,3 +1866,77 @@ func UnsafePoint(pc uintptr) bool {
 		panic("invalid unsafe point code " + string(itoa(buf[:], uint64(v))))
 	}
 }
+
+type TraceMap struct {
+	traceMap
+}
+
+func (m *TraceMap) PutString(s string) (uint64, bool) {
+	return m.traceMap.put(unsafe.Pointer(unsafe.StringData(s)), uintptr(len(s)))
+}
+
+func (m *TraceMap) Reset() {
+	m.traceMap.reset()
+}
+
+func SetSpinInGCMarkDone(spin bool) {
+	gcDebugMarkDone.spinAfterRaggedBarrier.Store(spin)
+}
+
+func GCMarkDoneRestarted() bool {
+	// Only read this outside of the GC. If we're running during a GC, just report false.
+	mp := acquirem()
+	if gcphase != _GCoff {
+		releasem(mp)
+		return false
+	}
+	restarted := gcDebugMarkDone.restartedDueTo27993
+	releasem(mp)
+	return restarted
+}
+
+func GCMarkDoneResetRestartFlag() {
+	mp := acquirem()
+	for gcphase != _GCoff {
+		releasem(mp)
+		Gosched()
+		mp = acquirem()
+	}
+	gcDebugMarkDone.restartedDueTo27993 = false
+	releasem(mp)
+}
+
+type BitCursor struct {
+	b bitCursor
+}
+
+func NewBitCursor(buf *byte) BitCursor {
+	return BitCursor{b: bitCursor{ptr: buf, n: 0}}
+}
+
+func (b BitCursor) Write(data *byte, cnt uintptr) {
+	b.b.write(data, cnt)
+}
+func (b BitCursor) Offset(cnt uintptr) BitCursor {
+	return BitCursor{b: b.b.offset(cnt)}
+}
+
+const (
+	BubbleAssocUnbubbled     = bubbleAssocUnbubbled
+	BubbleAssocCurrentBubble = bubbleAssocCurrentBubble
+	BubbleAssocOtherBubble   = bubbleAssocOtherBubble
+)
+
+type TraceStackTable traceStackTable
+
+func (t *TraceStackTable) Reset() {
+	t.tab.reset()
+}
+
+func TraceStack(gp *G, tab *TraceStackTable) {
+	traceStack(0, gp, (*traceStackTable)(tab))
+}
+
+var DebugDecorateMappings = &debug.decoratemappings
+
+func SetVMANameSupported() bool { return setVMANameSupported() }

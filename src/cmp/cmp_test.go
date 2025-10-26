@@ -10,6 +10,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -158,8 +159,8 @@ func ExampleOr_sort() {
 	// Sort by customer first, product second, and last by higher price
 	slices.SortFunc(orders, func(a, b Order) int {
 		return cmp.Or(
-			cmp.Compare(a.Customer, b.Customer),
-			cmp.Compare(a.Product, b.Product),
+			strings.Compare(a.Customer, b.Customer),
+			strings.Compare(a.Product, b.Product),
 			cmp.Compare(b.Price, a.Price),
 		)
 	})
@@ -174,4 +175,28 @@ func ExampleOr_sort() {
 	// foo bob 4.00
 	// bar carol 1.00
 	// baz carol 4.00
+}
+
+func ExampleLess() {
+	fmt.Println(cmp.Less(1, 2))
+	fmt.Println(cmp.Less("a", "aa"))
+	fmt.Println(cmp.Less(1.0, math.NaN()))
+	fmt.Println(cmp.Less(math.NaN(), 1.0))
+	// Output:
+	// true
+	// true
+	// false
+	// true
+}
+
+func ExampleCompare() {
+	fmt.Println(cmp.Compare(1, 2))
+	fmt.Println(cmp.Compare("a", "aa"))
+	fmt.Println(cmp.Compare(1.5, 1.5))
+	fmt.Println(cmp.Compare(math.NaN(), 1.0))
+	// Output:
+	// -1
+	// -1
+	// 0
+	// -1
 }

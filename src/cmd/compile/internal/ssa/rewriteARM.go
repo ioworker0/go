@@ -151,6 +151,14 @@ func rewriteValueARM(v *Value) bool {
 		return rewriteValueARM_OpARMLessThan(v)
 	case OpARMLessThanU:
 		return rewriteValueARM_OpARMLessThanU(v)
+	case OpARMLoweredPanicBoundsRC:
+		return rewriteValueARM_OpARMLoweredPanicBoundsRC(v)
+	case OpARMLoweredPanicBoundsRR:
+		return rewriteValueARM_OpARMLoweredPanicBoundsRR(v)
+	case OpARMLoweredPanicExtendRC:
+		return rewriteValueARM_OpARMLoweredPanicExtendRC(v)
+	case OpARMLoweredPanicExtendRR:
+		return rewriteValueARM_OpARMLoweredPanicExtendRR(v)
 	case OpARMMOVBUload:
 		return rewriteValueARM_OpARMMOVBUload(v)
 	case OpARMMOVBUloadidx:
@@ -466,8 +474,12 @@ func rewriteValueARM(v *Value) bool {
 		return true
 	case OpAvg32u:
 		return rewriteValueARM_OpAvg32u(v)
+	case OpBitLen16:
+		return rewriteValueARM_OpBitLen16(v)
 	case OpBitLen32:
 		return rewriteValueARM_OpBitLen32(v)
+	case OpBitLen8:
+		return rewriteValueARM_OpBitLen8(v)
 	case OpBswap32:
 		return rewriteValueARM_OpBswap32(v)
 	case OpClosureCall:
@@ -741,9 +753,11 @@ func rewriteValueARM(v *Value) bool {
 		v.Op = OpARMOR
 		return true
 	case OpPanicBounds:
-		return rewriteValueARM_OpPanicBounds(v)
+		v.Op = OpARMLoweredPanicBoundsRR
+		return true
 	case OpPanicExtend:
-		return rewriteValueARM_OpPanicExtend(v)
+		v.Op = OpARMLoweredPanicExtendRR
+		return true
 	case OpRotateLeft16:
 		return rewriteValueARM_OpRotateLeft16(v)
 	case OpRotateLeft32:
@@ -4544,6 +4558,135 @@ func rewriteValueARM_OpARMLessThanU(v *Value) bool {
 	}
 	return false
 }
+func rewriteValueARM_OpARMLoweredPanicBoundsRC(v *Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (LoweredPanicBoundsRC [kind] {p} (MOVWconst [c]) mem)
+	// result: (LoweredPanicBoundsCC [kind] {PanicBoundsCC{Cx:int64(c), Cy:p.C}} mem)
+	for {
+		kind := auxIntToInt64(v.AuxInt)
+		p := auxToPanicBoundsC(v.Aux)
+		if v_0.Op != OpARMMOVWconst {
+			break
+		}
+		c := auxIntToInt32(v_0.AuxInt)
+		mem := v_1
+		v.reset(OpARMLoweredPanicBoundsCC)
+		v.AuxInt = int64ToAuxInt(kind)
+		v.Aux = panicBoundsCCToAux(PanicBoundsCC{Cx: int64(c), Cy: p.C})
+		v.AddArg(mem)
+		return true
+	}
+	return false
+}
+func rewriteValueARM_OpARMLoweredPanicBoundsRR(v *Value) bool {
+	v_2 := v.Args[2]
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (LoweredPanicBoundsRR [kind] x (MOVWconst [c]) mem)
+	// result: (LoweredPanicBoundsRC [kind] x {PanicBoundsC{C:int64(c)}} mem)
+	for {
+		kind := auxIntToInt64(v.AuxInt)
+		x := v_0
+		if v_1.Op != OpARMMOVWconst {
+			break
+		}
+		c := auxIntToInt32(v_1.AuxInt)
+		mem := v_2
+		v.reset(OpARMLoweredPanicBoundsRC)
+		v.AuxInt = int64ToAuxInt(kind)
+		v.Aux = panicBoundsCToAux(PanicBoundsC{C: int64(c)})
+		v.AddArg2(x, mem)
+		return true
+	}
+	// match: (LoweredPanicBoundsRR [kind] (MOVWconst [c]) y mem)
+	// result: (LoweredPanicBoundsCR [kind] {PanicBoundsC{C:int64(c)}} y mem)
+	for {
+		kind := auxIntToInt64(v.AuxInt)
+		if v_0.Op != OpARMMOVWconst {
+			break
+		}
+		c := auxIntToInt32(v_0.AuxInt)
+		y := v_1
+		mem := v_2
+		v.reset(OpARMLoweredPanicBoundsCR)
+		v.AuxInt = int64ToAuxInt(kind)
+		v.Aux = panicBoundsCToAux(PanicBoundsC{C: int64(c)})
+		v.AddArg2(y, mem)
+		return true
+	}
+	return false
+}
+func rewriteValueARM_OpARMLoweredPanicExtendRC(v *Value) bool {
+	v_2 := v.Args[2]
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (LoweredPanicExtendRC [kind] {p} (MOVWconst [hi]) (MOVWconst [lo]) mem)
+	// result: (LoweredPanicBoundsCC [kind] {PanicBoundsCC{Cx:int64(hi)<<32+int64(uint32(lo)), Cy:p.C}} mem)
+	for {
+		kind := auxIntToInt64(v.AuxInt)
+		p := auxToPanicBoundsC(v.Aux)
+		if v_0.Op != OpARMMOVWconst {
+			break
+		}
+		hi := auxIntToInt32(v_0.AuxInt)
+		if v_1.Op != OpARMMOVWconst {
+			break
+		}
+		lo := auxIntToInt32(v_1.AuxInt)
+		mem := v_2
+		v.reset(OpARMLoweredPanicBoundsCC)
+		v.AuxInt = int64ToAuxInt(kind)
+		v.Aux = panicBoundsCCToAux(PanicBoundsCC{Cx: int64(hi)<<32 + int64(uint32(lo)), Cy: p.C})
+		v.AddArg(mem)
+		return true
+	}
+	return false
+}
+func rewriteValueARM_OpARMLoweredPanicExtendRR(v *Value) bool {
+	v_3 := v.Args[3]
+	v_2 := v.Args[2]
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (LoweredPanicExtendRR [kind] hi lo (MOVWconst [c]) mem)
+	// result: (LoweredPanicExtendRC [kind] hi lo {PanicBoundsC{C:int64(c)}} mem)
+	for {
+		kind := auxIntToInt64(v.AuxInt)
+		hi := v_0
+		lo := v_1
+		if v_2.Op != OpARMMOVWconst {
+			break
+		}
+		c := auxIntToInt32(v_2.AuxInt)
+		mem := v_3
+		v.reset(OpARMLoweredPanicExtendRC)
+		v.AuxInt = int64ToAuxInt(kind)
+		v.Aux = panicBoundsCToAux(PanicBoundsC{C: int64(c)})
+		v.AddArg3(hi, lo, mem)
+		return true
+	}
+	// match: (LoweredPanicExtendRR [kind] (MOVWconst [hi]) (MOVWconst [lo]) y mem)
+	// result: (LoweredPanicBoundsCR [kind] {PanicBoundsC{C:int64(hi)<<32 + int64(uint32(lo))}} y mem)
+	for {
+		kind := auxIntToInt64(v.AuxInt)
+		if v_0.Op != OpARMMOVWconst {
+			break
+		}
+		hi := auxIntToInt32(v_0.AuxInt)
+		if v_1.Op != OpARMMOVWconst {
+			break
+		}
+		lo := auxIntToInt32(v_1.AuxInt)
+		y := v_2
+		mem := v_3
+		v.reset(OpARMLoweredPanicBoundsCR)
+		v.AuxInt = int64ToAuxInt(kind)
+		v.Aux = panicBoundsCToAux(PanicBoundsC{C: int64(hi)<<32 + int64(uint32(lo))})
+		v.AddArg2(y, mem)
+		return true
+	}
+	return false
+}
 func rewriteValueARM_OpARMMOVBUload(v *Value) bool {
 	v_1 := v.Args[1]
 	v_0 := v.Args[0]
@@ -4861,6 +5004,19 @@ func rewriteValueARM_OpARMMOVBload(v *Value) bool {
 		}
 		v.reset(OpARMMOVBloadidx)
 		v.AddArg3(ptr, idx, mem)
+		return true
+	}
+	// match: (MOVBload [off] {sym} (SB) _)
+	// cond: symIsRO(sym)
+	// result: (MOVWconst [int32(int8(read8(sym, int64(off))))])
+	for {
+		off := auxIntToInt32(v.AuxInt)
+		sym := auxToSym(v.Aux)
+		if v_0.Op != OpSB || !(symIsRO(sym)) {
+			break
+		}
+		v.reset(OpARMMOVWconst)
+		v.AuxInt = int32ToAuxInt(int32(int8(read8(sym, int64(off)))))
 		return true
 	}
 	return false
@@ -5700,6 +5856,8 @@ func rewriteValueARM_OpARMMOVHUreg(v *Value) bool {
 func rewriteValueARM_OpARMMOVHload(v *Value) bool {
 	v_1 := v.Args[1]
 	v_0 := v.Args[0]
+	b := v.Block
+	config := b.Func.Config
 	// match: (MOVHload [off1] {sym} (ADDconst [off2] ptr) mem)
 	// result: (MOVHload [off1+off2] {sym} ptr mem)
 	for {
@@ -5796,6 +5954,19 @@ func rewriteValueARM_OpARMMOVHload(v *Value) bool {
 		}
 		v.reset(OpARMMOVHloadidx)
 		v.AddArg3(ptr, idx, mem)
+		return true
+	}
+	// match: (MOVHload [off] {sym} (SB) _)
+	// cond: symIsRO(sym)
+	// result: (MOVWconst [int32(int16(read16(sym, int64(off), config.ctxt.Arch.ByteOrder)))])
+	for {
+		off := auxIntToInt32(v.AuxInt)
+		sym := auxToSym(v.Aux)
+		if v_0.Op != OpSB || !(symIsRO(sym)) {
+			break
+		}
+		v.reset(OpARMMOVWconst)
+		v.AuxInt = int32ToAuxInt(int32(int16(read16(sym, int64(off), config.ctxt.Arch.ByteOrder))))
 		return true
 	}
 	return false
@@ -7009,7 +7180,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 		break
 	}
 	// match: (MUL x (MOVWconst [c]))
-	// cond: isPowerOfTwo32(c)
+	// cond: isPowerOfTwo(c)
 	// result: (SLLconst [int32(log32(c))] x)
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -7018,7 +7189,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 				continue
 			}
 			c := auxIntToInt32(v_1.AuxInt)
-			if !(isPowerOfTwo32(c)) {
+			if !(isPowerOfTwo(c)) {
 				continue
 			}
 			v.reset(OpARMSLLconst)
@@ -7029,7 +7200,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 		break
 	}
 	// match: (MUL x (MOVWconst [c]))
-	// cond: isPowerOfTwo32(c-1) && c >= 3
+	// cond: isPowerOfTwo(c-1) && c >= 3
 	// result: (ADDshiftLL x x [int32(log32(c-1))])
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -7038,7 +7209,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 				continue
 			}
 			c := auxIntToInt32(v_1.AuxInt)
-			if !(isPowerOfTwo32(c-1) && c >= 3) {
+			if !(isPowerOfTwo(c-1) && c >= 3) {
 				continue
 			}
 			v.reset(OpARMADDshiftLL)
@@ -7049,7 +7220,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 		break
 	}
 	// match: (MUL x (MOVWconst [c]))
-	// cond: isPowerOfTwo32(c+1) && c >= 7
+	// cond: isPowerOfTwo(c+1) && c >= 7
 	// result: (RSBshiftLL x x [int32(log32(c+1))])
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -7058,7 +7229,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 				continue
 			}
 			c := auxIntToInt32(v_1.AuxInt)
-			if !(isPowerOfTwo32(c+1) && c >= 7) {
+			if !(isPowerOfTwo(c+1) && c >= 7) {
 				continue
 			}
 			v.reset(OpARMRSBshiftLL)
@@ -7069,7 +7240,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 		break
 	}
 	// match: (MUL x (MOVWconst [c]))
-	// cond: c%3 == 0 && isPowerOfTwo32(c/3)
+	// cond: c%3 == 0 && isPowerOfTwo(c/3)
 	// result: (SLLconst [int32(log32(c/3))] (ADDshiftLL <x.Type> x x [1]))
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -7078,7 +7249,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 				continue
 			}
 			c := auxIntToInt32(v_1.AuxInt)
-			if !(c%3 == 0 && isPowerOfTwo32(c/3)) {
+			if !(c%3 == 0 && isPowerOfTwo(c/3)) {
 				continue
 			}
 			v.reset(OpARMSLLconst)
@@ -7092,7 +7263,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 		break
 	}
 	// match: (MUL x (MOVWconst [c]))
-	// cond: c%5 == 0 && isPowerOfTwo32(c/5)
+	// cond: c%5 == 0 && isPowerOfTwo(c/5)
 	// result: (SLLconst [int32(log32(c/5))] (ADDshiftLL <x.Type> x x [2]))
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -7101,7 +7272,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 				continue
 			}
 			c := auxIntToInt32(v_1.AuxInt)
-			if !(c%5 == 0 && isPowerOfTwo32(c/5)) {
+			if !(c%5 == 0 && isPowerOfTwo(c/5)) {
 				continue
 			}
 			v.reset(OpARMSLLconst)
@@ -7115,7 +7286,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 		break
 	}
 	// match: (MUL x (MOVWconst [c]))
-	// cond: c%7 == 0 && isPowerOfTwo32(c/7)
+	// cond: c%7 == 0 && isPowerOfTwo(c/7)
 	// result: (SLLconst [int32(log32(c/7))] (RSBshiftLL <x.Type> x x [3]))
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -7124,7 +7295,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 				continue
 			}
 			c := auxIntToInt32(v_1.AuxInt)
-			if !(c%7 == 0 && isPowerOfTwo32(c/7)) {
+			if !(c%7 == 0 && isPowerOfTwo(c/7)) {
 				continue
 			}
 			v.reset(OpARMSLLconst)
@@ -7138,7 +7309,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 		break
 	}
 	// match: (MUL x (MOVWconst [c]))
-	// cond: c%9 == 0 && isPowerOfTwo32(c/9)
+	// cond: c%9 == 0 && isPowerOfTwo(c/9)
 	// result: (SLLconst [int32(log32(c/9))] (ADDshiftLL <x.Type> x x [3]))
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -7147,7 +7318,7 @@ func rewriteValueARM_OpARMMUL(v *Value) bool {
 				continue
 			}
 			c := auxIntToInt32(v_1.AuxInt)
-			if !(c%9 == 0 && isPowerOfTwo32(c/9)) {
+			if !(c%9 == 0 && isPowerOfTwo(c/9)) {
 				continue
 			}
 			v.reset(OpARMSLLconst)
@@ -7225,7 +7396,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA x (MOVWconst [c]) a)
-	// cond: isPowerOfTwo32(c)
+	// cond: isPowerOfTwo(c)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c))] x) a)
 	for {
 		x := v_0
@@ -7234,7 +7405,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(isPowerOfTwo32(c)) {
+		if !(isPowerOfTwo(c)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7245,7 +7416,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA x (MOVWconst [c]) a)
-	// cond: isPowerOfTwo32(c-1) && c >= 3
+	// cond: isPowerOfTwo(c-1) && c >= 3
 	// result: (ADD (ADDshiftLL <x.Type> x x [int32(log32(c-1))]) a)
 	for {
 		x := v_0
@@ -7254,7 +7425,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(isPowerOfTwo32(c-1) && c >= 3) {
+		if !(isPowerOfTwo(c-1) && c >= 3) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7265,7 +7436,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA x (MOVWconst [c]) a)
-	// cond: isPowerOfTwo32(c+1) && c >= 7
+	// cond: isPowerOfTwo(c+1) && c >= 7
 	// result: (ADD (RSBshiftLL <x.Type> x x [int32(log32(c+1))]) a)
 	for {
 		x := v_0
@@ -7274,7 +7445,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(isPowerOfTwo32(c+1) && c >= 7) {
+		if !(isPowerOfTwo(c+1) && c >= 7) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7285,7 +7456,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA x (MOVWconst [c]) a)
-	// cond: c%3 == 0 && isPowerOfTwo32(c/3)
+	// cond: c%3 == 0 && isPowerOfTwo(c/3)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/3))] (ADDshiftLL <x.Type> x x [1])) a)
 	for {
 		x := v_0
@@ -7294,7 +7465,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%3 == 0 && isPowerOfTwo32(c/3)) {
+		if !(c%3 == 0 && isPowerOfTwo(c/3)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7308,7 +7479,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA x (MOVWconst [c]) a)
-	// cond: c%5 == 0 && isPowerOfTwo32(c/5)
+	// cond: c%5 == 0 && isPowerOfTwo(c/5)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/5))] (ADDshiftLL <x.Type> x x [2])) a)
 	for {
 		x := v_0
@@ -7317,7 +7488,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%5 == 0 && isPowerOfTwo32(c/5)) {
+		if !(c%5 == 0 && isPowerOfTwo(c/5)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7331,7 +7502,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA x (MOVWconst [c]) a)
-	// cond: c%7 == 0 && isPowerOfTwo32(c/7)
+	// cond: c%7 == 0 && isPowerOfTwo(c/7)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/7))] (RSBshiftLL <x.Type> x x [3])) a)
 	for {
 		x := v_0
@@ -7340,7 +7511,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%7 == 0 && isPowerOfTwo32(c/7)) {
+		if !(c%7 == 0 && isPowerOfTwo(c/7)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7354,7 +7525,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA x (MOVWconst [c]) a)
-	// cond: c%9 == 0 && isPowerOfTwo32(c/9)
+	// cond: c%9 == 0 && isPowerOfTwo(c/9)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/9))] (ADDshiftLL <x.Type> x x [3])) a)
 	for {
 		x := v_0
@@ -7363,7 +7534,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%9 == 0 && isPowerOfTwo32(c/9)) {
+		if !(c%9 == 0 && isPowerOfTwo(c/9)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7416,7 +7587,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA (MOVWconst [c]) x a)
-	// cond: isPowerOfTwo32(c)
+	// cond: isPowerOfTwo(c)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c))] x) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7425,7 +7596,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(isPowerOfTwo32(c)) {
+		if !(isPowerOfTwo(c)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7436,7 +7607,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA (MOVWconst [c]) x a)
-	// cond: isPowerOfTwo32(c-1) && c >= 3
+	// cond: isPowerOfTwo(c-1) && c >= 3
 	// result: (ADD (ADDshiftLL <x.Type> x x [int32(log32(c-1))]) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7445,7 +7616,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(isPowerOfTwo32(c-1) && c >= 3) {
+		if !(isPowerOfTwo(c-1) && c >= 3) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7456,7 +7627,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA (MOVWconst [c]) x a)
-	// cond: isPowerOfTwo32(c+1) && c >= 7
+	// cond: isPowerOfTwo(c+1) && c >= 7
 	// result: (ADD (RSBshiftLL <x.Type> x x [int32(log32(c+1))]) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7465,7 +7636,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(isPowerOfTwo32(c+1) && c >= 7) {
+		if !(isPowerOfTwo(c+1) && c >= 7) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7476,7 +7647,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA (MOVWconst [c]) x a)
-	// cond: c%3 == 0 && isPowerOfTwo32(c/3)
+	// cond: c%3 == 0 && isPowerOfTwo(c/3)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/3))] (ADDshiftLL <x.Type> x x [1])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7485,7 +7656,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%3 == 0 && isPowerOfTwo32(c/3)) {
+		if !(c%3 == 0 && isPowerOfTwo(c/3)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7499,7 +7670,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA (MOVWconst [c]) x a)
-	// cond: c%5 == 0 && isPowerOfTwo32(c/5)
+	// cond: c%5 == 0 && isPowerOfTwo(c/5)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/5))] (ADDshiftLL <x.Type> x x [2])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7508,7 +7679,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%5 == 0 && isPowerOfTwo32(c/5)) {
+		if !(c%5 == 0 && isPowerOfTwo(c/5)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7522,7 +7693,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA (MOVWconst [c]) x a)
-	// cond: c%7 == 0 && isPowerOfTwo32(c/7)
+	// cond: c%7 == 0 && isPowerOfTwo(c/7)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/7))] (RSBshiftLL <x.Type> x x [3])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7531,7 +7702,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%7 == 0 && isPowerOfTwo32(c/7)) {
+		if !(c%7 == 0 && isPowerOfTwo(c/7)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7545,7 +7716,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		return true
 	}
 	// match: (MULA (MOVWconst [c]) x a)
-	// cond: c%9 == 0 && isPowerOfTwo32(c/9)
+	// cond: c%9 == 0 && isPowerOfTwo(c/9)
 	// result: (ADD (SLLconst <x.Type> [int32(log32(c/9))] (ADDshiftLL <x.Type> x x [3])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7554,7 +7725,7 @@ func rewriteValueARM_OpARMMULA(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%9 == 0 && isPowerOfTwo32(c/9)) {
+		if !(c%9 == 0 && isPowerOfTwo(c/9)) {
 			break
 		}
 		v.reset(OpARMADD)
@@ -7679,7 +7850,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS x (MOVWconst [c]) a)
-	// cond: isPowerOfTwo32(c)
+	// cond: isPowerOfTwo(c)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c))] x) a)
 	for {
 		x := v_0
@@ -7688,7 +7859,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(isPowerOfTwo32(c)) {
+		if !(isPowerOfTwo(c)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7699,7 +7870,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS x (MOVWconst [c]) a)
-	// cond: isPowerOfTwo32(c-1) && c >= 3
+	// cond: isPowerOfTwo(c-1) && c >= 3
 	// result: (RSB (ADDshiftLL <x.Type> x x [int32(log32(c-1))]) a)
 	for {
 		x := v_0
@@ -7708,7 +7879,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(isPowerOfTwo32(c-1) && c >= 3) {
+		if !(isPowerOfTwo(c-1) && c >= 3) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7719,7 +7890,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS x (MOVWconst [c]) a)
-	// cond: isPowerOfTwo32(c+1) && c >= 7
+	// cond: isPowerOfTwo(c+1) && c >= 7
 	// result: (RSB (RSBshiftLL <x.Type> x x [int32(log32(c+1))]) a)
 	for {
 		x := v_0
@@ -7728,7 +7899,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(isPowerOfTwo32(c+1) && c >= 7) {
+		if !(isPowerOfTwo(c+1) && c >= 7) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7739,7 +7910,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS x (MOVWconst [c]) a)
-	// cond: c%3 == 0 && isPowerOfTwo32(c/3)
+	// cond: c%3 == 0 && isPowerOfTwo(c/3)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/3))] (ADDshiftLL <x.Type> x x [1])) a)
 	for {
 		x := v_0
@@ -7748,7 +7919,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%3 == 0 && isPowerOfTwo32(c/3)) {
+		if !(c%3 == 0 && isPowerOfTwo(c/3)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7762,7 +7933,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS x (MOVWconst [c]) a)
-	// cond: c%5 == 0 && isPowerOfTwo32(c/5)
+	// cond: c%5 == 0 && isPowerOfTwo(c/5)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/5))] (ADDshiftLL <x.Type> x x [2])) a)
 	for {
 		x := v_0
@@ -7771,7 +7942,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%5 == 0 && isPowerOfTwo32(c/5)) {
+		if !(c%5 == 0 && isPowerOfTwo(c/5)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7785,7 +7956,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS x (MOVWconst [c]) a)
-	// cond: c%7 == 0 && isPowerOfTwo32(c/7)
+	// cond: c%7 == 0 && isPowerOfTwo(c/7)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/7))] (RSBshiftLL <x.Type> x x [3])) a)
 	for {
 		x := v_0
@@ -7794,7 +7965,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%7 == 0 && isPowerOfTwo32(c/7)) {
+		if !(c%7 == 0 && isPowerOfTwo(c/7)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7808,7 +7979,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS x (MOVWconst [c]) a)
-	// cond: c%9 == 0 && isPowerOfTwo32(c/9)
+	// cond: c%9 == 0 && isPowerOfTwo(c/9)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/9))] (ADDshiftLL <x.Type> x x [3])) a)
 	for {
 		x := v_0
@@ -7817,7 +7988,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		}
 		c := auxIntToInt32(v_1.AuxInt)
 		a := v_2
-		if !(c%9 == 0 && isPowerOfTwo32(c/9)) {
+		if !(c%9 == 0 && isPowerOfTwo(c/9)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7870,7 +8041,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS (MOVWconst [c]) x a)
-	// cond: isPowerOfTwo32(c)
+	// cond: isPowerOfTwo(c)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c))] x) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7879,7 +8050,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(isPowerOfTwo32(c)) {
+		if !(isPowerOfTwo(c)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7890,7 +8061,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS (MOVWconst [c]) x a)
-	// cond: isPowerOfTwo32(c-1) && c >= 3
+	// cond: isPowerOfTwo(c-1) && c >= 3
 	// result: (RSB (ADDshiftLL <x.Type> x x [int32(log32(c-1))]) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7899,7 +8070,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(isPowerOfTwo32(c-1) && c >= 3) {
+		if !(isPowerOfTwo(c-1) && c >= 3) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7910,7 +8081,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS (MOVWconst [c]) x a)
-	// cond: isPowerOfTwo32(c+1) && c >= 7
+	// cond: isPowerOfTwo(c+1) && c >= 7
 	// result: (RSB (RSBshiftLL <x.Type> x x [int32(log32(c+1))]) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7919,7 +8090,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(isPowerOfTwo32(c+1) && c >= 7) {
+		if !(isPowerOfTwo(c+1) && c >= 7) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7930,7 +8101,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS (MOVWconst [c]) x a)
-	// cond: c%3 == 0 && isPowerOfTwo32(c/3)
+	// cond: c%3 == 0 && isPowerOfTwo(c/3)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/3))] (ADDshiftLL <x.Type> x x [1])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7939,7 +8110,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%3 == 0 && isPowerOfTwo32(c/3)) {
+		if !(c%3 == 0 && isPowerOfTwo(c/3)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7953,7 +8124,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS (MOVWconst [c]) x a)
-	// cond: c%5 == 0 && isPowerOfTwo32(c/5)
+	// cond: c%5 == 0 && isPowerOfTwo(c/5)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/5))] (ADDshiftLL <x.Type> x x [2])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7962,7 +8133,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%5 == 0 && isPowerOfTwo32(c/5)) {
+		if !(c%5 == 0 && isPowerOfTwo(c/5)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7976,7 +8147,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS (MOVWconst [c]) x a)
-	// cond: c%7 == 0 && isPowerOfTwo32(c/7)
+	// cond: c%7 == 0 && isPowerOfTwo(c/7)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/7))] (RSBshiftLL <x.Type> x x [3])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -7985,7 +8156,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%7 == 0 && isPowerOfTwo32(c/7)) {
+		if !(c%7 == 0 && isPowerOfTwo(c/7)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -7999,7 +8170,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		return true
 	}
 	// match: (MULS (MOVWconst [c]) x a)
-	// cond: c%9 == 0 && isPowerOfTwo32(c/9)
+	// cond: c%9 == 0 && isPowerOfTwo(c/9)
 	// result: (RSB (SLLconst <x.Type> [int32(log32(c/9))] (ADDshiftLL <x.Type> x x [3])) a)
 	for {
 		if v_0.Op != OpARMMOVWconst {
@@ -8008,7 +8179,7 @@ func rewriteValueARM_OpARMMULS(v *Value) bool {
 		c := auxIntToInt32(v_0.AuxInt)
 		x := v_1
 		a := v_2
-		if !(c%9 == 0 && isPowerOfTwo32(c/9)) {
+		if !(c%9 == 0 && isPowerOfTwo(c/9)) {
 			break
 		}
 		v.reset(OpARMRSB)
@@ -13042,6 +13213,21 @@ func rewriteValueARM_OpAvg32u(v *Value) bool {
 		return true
 	}
 }
+func rewriteValueARM_OpBitLen16(v *Value) bool {
+	v_0 := v.Args[0]
+	b := v.Block
+	typ := &b.Func.Config.Types
+	// match: (BitLen16 x)
+	// result: (BitLen32 (ZeroExt16to32 x))
+	for {
+		x := v_0
+		v.reset(OpBitLen32)
+		v0 := b.NewValue0(v.Pos, OpZeroExt16to32, typ.UInt32)
+		v0.AddArg(x)
+		v.AddArg(v0)
+		return true
+	}
+}
 func rewriteValueARM_OpBitLen32(v *Value) bool {
 	v_0 := v.Args[0]
 	b := v.Block
@@ -13053,6 +13239,21 @@ func rewriteValueARM_OpBitLen32(v *Value) bool {
 		v.reset(OpARMRSBconst)
 		v.AuxInt = int32ToAuxInt(32)
 		v0 := b.NewValue0(v.Pos, OpARMCLZ, t)
+		v0.AddArg(x)
+		v.AddArg(v0)
+		return true
+	}
+}
+func rewriteValueARM_OpBitLen8(v *Value) bool {
+	v_0 := v.Args[0]
+	b := v.Block
+	typ := &b.Func.Config.Types
+	// match: (BitLen8 x)
+	// result: (BitLen32 (ZeroExt8to32 x))
+	for {
+		x := v_0
+		v.reset(OpBitLen32)
+		v0 := b.NewValue0(v.Pos, OpZeroExt8to32, typ.UInt32)
 		v0.AddArg(x)
 		v.AddArg(v0)
 		return true
@@ -14689,7 +14890,7 @@ func rewriteValueARM_OpMove(v *Value) bool {
 		return true
 	}
 	// match: (Move [s] {t} dst src mem)
-	// cond: s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0 && !config.noDuffDevice && logLargeCopy(v, s)
+	// cond: s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0 && logLargeCopy(v, s)
 	// result: (DUFFCOPY [8 * (128 - s/4)] dst src mem)
 	for {
 		s := auxIntToInt64(v.AuxInt)
@@ -14697,7 +14898,7 @@ func rewriteValueARM_OpMove(v *Value) bool {
 		dst := v_0
 		src := v_1
 		mem := v_2
-		if !(s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0 && !config.noDuffDevice && logLargeCopy(v, s)) {
+		if !(s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0 && logLargeCopy(v, s)) {
 			break
 		}
 		v.reset(OpARMDUFFCOPY)
@@ -14706,7 +14907,7 @@ func rewriteValueARM_OpMove(v *Value) bool {
 		return true
 	}
 	// match: (Move [s] {t} dst src mem)
-	// cond: ((s > 512 || config.noDuffDevice) || t.Alignment()%4 != 0) && logLargeCopy(v, s)
+	// cond: (s > 512 || t.Alignment()%4 != 0) && logLargeCopy(v, s)
 	// result: (LoweredMove [t.Alignment()] dst src (ADDconst <src.Type> src [int32(s-moveSize(t.Alignment(), config))]) mem)
 	for {
 		s := auxIntToInt64(v.AuxInt)
@@ -14714,7 +14915,7 @@ func rewriteValueARM_OpMove(v *Value) bool {
 		dst := v_0
 		src := v_1
 		mem := v_2
-		if !(((s > 512 || config.noDuffDevice) || t.Alignment()%4 != 0) && logLargeCopy(v, s)) {
+		if !((s > 512 || t.Alignment()%4 != 0) && logLargeCopy(v, s)) {
 			break
 		}
 		v.reset(OpARMLoweredMove)
@@ -14906,118 +15107,6 @@ func rewriteValueARM_OpOffPtr(v *Value) bool {
 		v.AddArg(ptr)
 		return true
 	}
-}
-func rewriteValueARM_OpPanicBounds(v *Value) bool {
-	v_2 := v.Args[2]
-	v_1 := v.Args[1]
-	v_0 := v.Args[0]
-	// match: (PanicBounds [kind] x y mem)
-	// cond: boundsABI(kind) == 0
-	// result: (LoweredPanicBoundsA [kind] x y mem)
-	for {
-		kind := auxIntToInt64(v.AuxInt)
-		x := v_0
-		y := v_1
-		mem := v_2
-		if !(boundsABI(kind) == 0) {
-			break
-		}
-		v.reset(OpARMLoweredPanicBoundsA)
-		v.AuxInt = int64ToAuxInt(kind)
-		v.AddArg3(x, y, mem)
-		return true
-	}
-	// match: (PanicBounds [kind] x y mem)
-	// cond: boundsABI(kind) == 1
-	// result: (LoweredPanicBoundsB [kind] x y mem)
-	for {
-		kind := auxIntToInt64(v.AuxInt)
-		x := v_0
-		y := v_1
-		mem := v_2
-		if !(boundsABI(kind) == 1) {
-			break
-		}
-		v.reset(OpARMLoweredPanicBoundsB)
-		v.AuxInt = int64ToAuxInt(kind)
-		v.AddArg3(x, y, mem)
-		return true
-	}
-	// match: (PanicBounds [kind] x y mem)
-	// cond: boundsABI(kind) == 2
-	// result: (LoweredPanicBoundsC [kind] x y mem)
-	for {
-		kind := auxIntToInt64(v.AuxInt)
-		x := v_0
-		y := v_1
-		mem := v_2
-		if !(boundsABI(kind) == 2) {
-			break
-		}
-		v.reset(OpARMLoweredPanicBoundsC)
-		v.AuxInt = int64ToAuxInt(kind)
-		v.AddArg3(x, y, mem)
-		return true
-	}
-	return false
-}
-func rewriteValueARM_OpPanicExtend(v *Value) bool {
-	v_3 := v.Args[3]
-	v_2 := v.Args[2]
-	v_1 := v.Args[1]
-	v_0 := v.Args[0]
-	// match: (PanicExtend [kind] hi lo y mem)
-	// cond: boundsABI(kind) == 0
-	// result: (LoweredPanicExtendA [kind] hi lo y mem)
-	for {
-		kind := auxIntToInt64(v.AuxInt)
-		hi := v_0
-		lo := v_1
-		y := v_2
-		mem := v_3
-		if !(boundsABI(kind) == 0) {
-			break
-		}
-		v.reset(OpARMLoweredPanicExtendA)
-		v.AuxInt = int64ToAuxInt(kind)
-		v.AddArg4(hi, lo, y, mem)
-		return true
-	}
-	// match: (PanicExtend [kind] hi lo y mem)
-	// cond: boundsABI(kind) == 1
-	// result: (LoweredPanicExtendB [kind] hi lo y mem)
-	for {
-		kind := auxIntToInt64(v.AuxInt)
-		hi := v_0
-		lo := v_1
-		y := v_2
-		mem := v_3
-		if !(boundsABI(kind) == 1) {
-			break
-		}
-		v.reset(OpARMLoweredPanicExtendB)
-		v.AuxInt = int64ToAuxInt(kind)
-		v.AddArg4(hi, lo, y, mem)
-		return true
-	}
-	// match: (PanicExtend [kind] hi lo y mem)
-	// cond: boundsABI(kind) == 2
-	// result: (LoweredPanicExtendC [kind] hi lo y mem)
-	for {
-		kind := auxIntToInt64(v.AuxInt)
-		hi := v_0
-		lo := v_1
-		y := v_2
-		mem := v_3
-		if !(boundsABI(kind) == 2) {
-			break
-		}
-		v.reset(OpARMLoweredPanicExtendC)
-		v.AuxInt = int64ToAuxInt(kind)
-		v.AddArg4(hi, lo, y, mem)
-		return true
-	}
-	return false
 }
 func rewriteValueARM_OpRotateLeft16(v *Value) bool {
 	v_1 := v.Args[1]
@@ -15734,7 +15823,7 @@ func rewriteValueARM_OpSelect0(v *Value) bool {
 		return true
 	}
 	// match: (Select0 (CALLudiv x (MOVWconst [c])))
-	// cond: isPowerOfTwo32(c)
+	// cond: isPowerOfTwo(c)
 	// result: (SRLconst [int32(log32(c))] x)
 	for {
 		if v_0.Op != OpARMCALLudiv {
@@ -15747,7 +15836,7 @@ func rewriteValueARM_OpSelect0(v *Value) bool {
 			break
 		}
 		c := auxIntToInt32(v_0_1.AuxInt)
-		if !(isPowerOfTwo32(c)) {
+		if !(isPowerOfTwo(c)) {
 			break
 		}
 		v.reset(OpARMSRLconst)
@@ -15800,7 +15889,7 @@ func rewriteValueARM_OpSelect1(v *Value) bool {
 		return true
 	}
 	// match: (Select1 (CALLudiv x (MOVWconst [c])))
-	// cond: isPowerOfTwo32(c)
+	// cond: isPowerOfTwo(c)
 	// result: (ANDconst [c-1] x)
 	for {
 		if v_0.Op != OpARMCALLudiv {
@@ -15813,7 +15902,7 @@ func rewriteValueARM_OpSelect1(v *Value) bool {
 			break
 		}
 		c := auxIntToInt32(v_0_1.AuxInt)
-		if !(isPowerOfTwo32(c)) {
+		if !(isPowerOfTwo(c)) {
 			break
 		}
 		v.reset(OpARMANDconst)
@@ -16113,14 +16202,14 @@ func rewriteValueARM_OpZero(v *Value) bool {
 		return true
 	}
 	// match: (Zero [s] {t} ptr mem)
-	// cond: s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0 && !config.noDuffDevice
+	// cond: s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0
 	// result: (DUFFZERO [4 * (128 - s/4)] ptr (MOVWconst [0]) mem)
 	for {
 		s := auxIntToInt64(v.AuxInt)
 		t := auxToType(v.Aux)
 		ptr := v_0
 		mem := v_1
-		if !(s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0 && !config.noDuffDevice) {
+		if !(s%4 == 0 && s > 4 && s <= 512 && t.Alignment()%4 == 0) {
 			break
 		}
 		v.reset(OpARMDUFFZERO)
@@ -16131,14 +16220,14 @@ func rewriteValueARM_OpZero(v *Value) bool {
 		return true
 	}
 	// match: (Zero [s] {t} ptr mem)
-	// cond: (s > 512 || config.noDuffDevice) || t.Alignment()%4 != 0
+	// cond: s > 512 || t.Alignment()%4 != 0
 	// result: (LoweredZero [t.Alignment()] ptr (ADDconst <ptr.Type> ptr [int32(s-moveSize(t.Alignment(), config))]) (MOVWconst [0]) mem)
 	for {
 		s := auxIntToInt64(v.AuxInt)
 		t := auxToType(v.Aux)
 		ptr := v_0
 		mem := v_1
-		if !((s > 512 || config.noDuffDevice) || t.Alignment()%4 != 0) {
+		if !(s > 512 || t.Alignment()%4 != 0) {
 			break
 		}
 		v.reset(OpARMLoweredZero)

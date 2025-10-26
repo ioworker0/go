@@ -37,6 +37,7 @@ import (
 	"internal/abi"
 	"internal/buildcfg"
 	"log"
+	"math"
 	"math/bits"
 	"strings"
 )
@@ -90,6 +91,29 @@ func isNOTOCfunc(name string) bool {
 	}
 }
 
+// Try converting FMOVD/FMOVS to XXSPLTIDP. If it is converted,
+// return true.
+func convertFMOVtoXXSPLTIDP(p *obj.Prog) bool {
+	if p.From.Type != obj.TYPE_FCONST || buildcfg.GOPPC64 < 10 {
+		return false
+	}
+	v := p.From.Val.(float64)
+	if float64(float32(v)) != v {
+		return false
+	}
+	// Secondly, is this value a normal value?
+	ival := int64(math.Float32bits(float32(v)))
+	isDenorm := ival&0x7F800000 == 0 && ival&0x007FFFFF != 0
+	if !isDenorm {
+		p.As = AXXSPLTIDP
+		p.From.Type = obj.TYPE_CONST
+		p.From.Offset = ival
+		// Convert REG_Fx into equivalent REG_VSx
+		p.To.Reg = REG_VS0 + (p.To.Reg & 31)
+	}
+	return !isDenorm
+}
+
 func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
 	p.From.Class = 0
 	p.To.Class = 0
@@ -111,7 +135,7 @@ func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
 	// Rewrite float constants to values stored in memory.
 	switch p.As {
 	case AFMOVS:
-		if p.From.Type == obj.TYPE_FCONST {
+		if p.From.Type == obj.TYPE_FCONST && !convertFMOVtoXXSPLTIDP(p) {
 			f32 := float32(p.From.Val.(float64))
 			p.From.Type = obj.TYPE_MEM
 			p.From.Sym = ctxt.Float32Sym(f32)
@@ -123,7 +147,7 @@ func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
 		if p.From.Type == obj.TYPE_FCONST {
 			f64 := p.From.Val.(float64)
 			// Constant not needed in memory for float +/- 0
-			if f64 != 0 {
+			if f64 != 0 && !convertFMOVtoXXSPLTIDP(p) {
 				p.From.Type = obj.TYPE_MEM
 				p.From.Sym = ctxt.Float64Sym(f64)
 				p.From.Name = obj.NAME_EXTERN
@@ -176,8 +200,8 @@ func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
 			// Is this a shifted 16b constant? If so, rewrite it to avoid a creating and loading a constant.
 			val := p.From.Offset
 			shift := bits.TrailingZeros64(uint64(val))
-			mask := 0xFFFF << shift
-			if val&int64(mask) == val || (val>>(shift+16) == -1 && (val>>shift)<<shift == val) {
+			mask := int64(0xFFFF) << shift
+			if val&mask == val || (val>>(shift+16) == -1 && (val>>shift)<<shift == val) {
 				// Rewrite this value into MOVD $const>>shift, Rto; SLD $shift, Rto
 				q := obj.Appendp(p, c.newprog)
 				q.As = ASLD
@@ -782,8 +806,6 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	}
 
 	autosize := int32(0)
-	var p1 *obj.Prog
-	var p2 *obj.Prog
 	for p := c.cursym.Func().Text; p != nil; p = p.Link {
 		o := p.As
 		switch o {
@@ -843,11 +865,12 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				q.Pos = p.Pos
 				q.From.Type = obj.TYPE_CONST
 				q.From.Offset = 0x38420000
-				rel := obj.Addrel(c.cursym)
-				rel.Off = 0
-				rel.Siz = 8
-				rel.Sym = c.ctxt.Lookup(".TOC.")
-				rel.Type = objabi.R_ADDRPOWER_PCREL
+				c.cursym.AddRel(c.ctxt, obj.Reloc{
+					Type: objabi.R_ADDRPOWER_PCREL,
+					Off:  0,
+					Siz:  8,
+					Sym:  c.ctxt.Lookup(".TOC."),
+				})
 			}
 
 			if !c.cursym.Func().Text.From.Sym.NoSplit() {
@@ -880,44 +903,38 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 					q.To.Reg = REGSP
 					q.Spadj = autosize
 				} else {
-					// Frame size is too large for a MOVDU instruction.
-					// Store link register before decrementing SP, so if a signal comes
-					// during the execution of the function prologue, the traceback
-					// code will not see a half-updated stack frame.
-					// This sequence is not async preemptible, as if we open a frame
-					// at the current SP, it will clobber the saved LR.
+					// Frame size is too large for an stdu MOVDU instruction, use stdux MOVDU.
 					q = obj.Appendp(q, c.newprog)
 					q.As = AMOVD
 					q.Pos = p.Pos
 					q.From.Type = obj.TYPE_REG
 					q.From.Reg = REG_LR
 					q.To.Type = obj.TYPE_REG
-					q.To.Reg = REG_R29 // REGTMP may be used to synthesize large offset in the next instruction
+					q.To.Reg = REG_R29
 
-					q = c.ctxt.StartUnsafePoint(q, c.newprog)
-
+					// Create stack adjustment in REGTMP
 					q = obj.Appendp(q, c.newprog)
 					q.As = AMOVD
-					q.Pos = p.Pos
-					q.From.Type = obj.TYPE_REG
-					q.From.Reg = REG_R29
-					q.To.Type = obj.TYPE_MEM
-					q.To.Offset = int64(-autosize)
-					q.To.Reg = REGSP
-
-					prologueEnd = q
-
-					q = obj.Appendp(q, c.newprog)
-					q.As = AADD
 					q.Pos = p.Pos
 					q.From.Type = obj.TYPE_CONST
 					q.From.Offset = int64(-autosize)
 					q.To.Type = obj.TYPE_REG
-					q.To.Reg = REGSP
-					q.Spadj = +autosize
+					q.To.Reg = REGTMP
 
-					q = c.ctxt.EndUnsafePoint(q, c.newprog, -1)
+					prologueEnd = q
+
+					// MOVDU R29, R31(R1)
+					q = obj.Appendp(q, c.newprog)
+					q.As = AMOVDU
+					q.Pos = p.Pos
+					q.From.Type = obj.TYPE_REG
+					q.From.Reg = REG_R29
+					q.To.Type = obj.TYPE_MEM
+					q.To.Reg = REGTMP
+					q.To.Index = REGSP
+					q.Spadj = autosize
 				}
+
 				prologueEnd.Pos = prologueEnd.Pos.WithXlogue(src.PosPrologueEnd)
 			} else if c.cursym.Func().Text.Mark&LEAF == 0 {
 				// A very few functions that do not return to their caller
@@ -940,96 +957,6 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				q.To.Type = obj.TYPE_MEM
 				q.To.Reg = REGSP
 				q.To.Offset = 24
-			}
-
-			if c.cursym.Func().Text.From.Sym.Wrapper() {
-				// if(g->panic != nil && g->panic->argp == FP) g->panic->argp = bottom-of-frame
-				//
-				//	MOVD g_panic(g), R3
-				//	CMP R0, R3
-				//	BEQ end
-				//	MOVD panic_argp(R3), R4
-				//	ADD $(autosize+8), R1, R5
-				//	CMP R4, R5
-				//	BNE end
-				//	ADD $8, R1, R6
-				//	MOVD R6, panic_argp(R3)
-				// end:
-				//	NOP
-				//
-				// The NOP is needed to give the jumps somewhere to land.
-				// It is a liblink NOP, not a ppc64 NOP: it encodes to 0 instruction bytes.
-
-				q = obj.Appendp(q, c.newprog)
-
-				q.As = AMOVD
-				q.From.Type = obj.TYPE_MEM
-				q.From.Reg = REGG
-				q.From.Offset = 4 * int64(c.ctxt.Arch.PtrSize) // G.panic
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R22
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ACMP
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R0
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R22
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ABEQ
-				q.To.Type = obj.TYPE_BRANCH
-				p1 = q
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AMOVD
-				q.From.Type = obj.TYPE_MEM
-				q.From.Reg = REG_R22
-				q.From.Offset = 0 // Panic.argp
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R23
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AADD
-				q.From.Type = obj.TYPE_CONST
-				q.From.Offset = int64(autosize) + c.ctxt.Arch.FixedFrameSize
-				q.Reg = REGSP
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R24
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ACMP
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R23
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R24
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ABNE
-				q.To.Type = obj.TYPE_BRANCH
-				p2 = q
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AADD
-				q.From.Type = obj.TYPE_CONST
-				q.From.Offset = c.ctxt.Arch.FixedFrameSize
-				q.Reg = REGSP
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R25
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AMOVD
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R25
-				q.To.Type = obj.TYPE_MEM
-				q.To.Reg = REG_R22
-				q.To.Offset = 0 // Panic.argp
-
-				q = obj.Appendp(q, c.newprog)
-
-				q.As = obj.ANOP
-				p1.To.SetTarget(q)
-				p2.To.SetTarget(q)
 			}
 
 		case obj.ARET:

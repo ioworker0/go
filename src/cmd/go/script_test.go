@@ -22,15 +22,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/gover"
-	"cmd/go/internal/script"
-	"cmd/go/internal/script/scripttest"
 	"cmd/go/internal/vcweb/vcstest"
+	"cmd/internal/script"
+	"cmd/internal/script/scripttest"
 
 	"golang.org/x/telemetry/counter/countertest"
 )
@@ -41,6 +40,10 @@ var testSum = flag.String("testsum", "", `may be tidy, listm, or listall. If set
 func TestScript(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 	testenv.SkipIfShortAndSlow(t)
+
+	if testing.Short() && runtime.GOOS == "plan9" {
+		t.Skipf("skipping test in -short mode on %s", runtime.GOOS)
+	}
 
 	srv, err := vcstest.NewServer()
 	if err != nil {
@@ -90,7 +93,7 @@ func TestScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine := &script.Engine{
-		Conds: scriptConditions(),
+		Conds: scriptConditions(t),
 		Cmds:  scriptCommands(quitSignal(), gracePeriod),
 		Quiet: !testing.Verbose(),
 	}
@@ -180,7 +183,7 @@ func tbFromContext(ctx context.Context) (testing.TB, bool) {
 	return t.(testing.TB), true
 }
 
-// initScriptState creates the initial directory structure in s for unpacking a
+// initScriptDirs creates the initial directory structure in s for unpacking a
 // cmd/go script.
 func initScriptDirs(t testing.TB, s *script.State) (telemetryDir string) {
 	must := func(err error) {
@@ -264,10 +267,10 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 	if testing.Short() {
 		// VCS commands are always somewhat slow: they either require access to external hosts,
 		// or they require our intercepted vcs-test.golang.org to regenerate the repository.
-		// Require all tests that use VCS commands to be skipped in short mode.
-		env = append(env, "TESTGOVCS=panic")
+		// Require all tests that use VCS commands which require remote lookups to be skipped in
+		// short mode.
+		env = append(env, "TESTGOVCSREMOTE=panic")
 	}
-
 	if os.Getenv("CGO_ENABLED") != "" || runtime.GOOS != goHostOS || runtime.GOARCH != goHostArch {
 		// If the actual CGO_ENABLED might not match the cmd/go default, set it
 		// explicitly in the environment. Otherwise, leave it unset so that we also
@@ -395,30 +398,11 @@ func readCounters(t *testing.T, telemetryDir string) map[string]uint64 {
 	return totals
 }
 
-//go:embed testdata/counters.txt
-var countersTxt string
-
-var (
-	allowedCountersOnce sync.Once
-	allowedCounters     = map[string]bool{} // Set of allowed counters.
-)
-
 func checkCounters(t *testing.T, telemetryDir string) {
-	allowedCountersOnce.Do(func() {
-		for _, counter := range strings.Fields(countersTxt) {
-			allowedCounters[counter] = true
-		}
-	})
 	counters := readCounters(t, telemetryDir)
 	if _, ok := scriptGoInvoked.Load(testing.TB(t)); ok {
 		if !disabledOnPlatform && len(counters) == 0 {
 			t.Fatal("go was invoked but no counters were incremented")
-		}
-	}
-	for name := range counters {
-		if !allowedCounters[name] {
-			t.Fatalf("incremented counter %q is not in testdata/counters.txt. "+
-				"Please update counters_test.go to produce an entry for it.", name)
 		}
 	}
 }

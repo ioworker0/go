@@ -35,10 +35,11 @@ func startProcess(name string, argv []string, attr *ProcAttr) (p *Process, err e
 		}
 	}
 
+	attrSys, shouldDupPidfd := ensurePidfd(attr.Sys)
 	sysattr := &syscall.ProcAttr{
 		Dir: attr.Dir,
 		Env: attr.Env,
-		Sys: attr.Sys,
+		Sys: attrSys,
 	}
 	if sysattr.Env == nil {
 		sysattr.Env, err = execenv.Default(sysattr.Sys)
@@ -60,11 +61,37 @@ func startProcess(name string, argv []string, attr *ProcAttr) (p *Process, err e
 		return nil, &PathError{Op: "fork/exec", Path: name, Err: e}
 	}
 
-	return newProcess(pid, h), nil
+	// For Windows, syscall.StartProcess above already returned a process handle.
+	if runtime.GOOS != "windows" {
+		var ok bool
+		h, ok = getPidfd(sysattr.Sys, shouldDupPidfd)
+		if !ok {
+			return newPIDProcess(pid), nil
+		}
+	}
+
+	return newHandleProcess(pid, h), nil
 }
 
 func (p *Process) kill() error {
 	return p.Signal(Kill)
+}
+
+func (p *Process) withHandle(f func(handle uintptr)) error {
+	if p.handle == nil {
+		return ErrNoHandle
+	}
+	handle, status := p.handleTransientAcquire()
+	switch status {
+	case statusDone:
+		return ErrProcessDone
+	case statusReleased:
+		return errProcessReleased
+	}
+	defer p.handleTransientRelease()
+	f(handle)
+
+	return nil
 }
 
 // ProcessState stores information about a process, as reported by Wait.

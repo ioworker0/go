@@ -21,20 +21,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"reflect"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	_ "unsafe"
 )
 
-var (
-	driversMu sync.RWMutex
-	drivers   = make(map[string]driver.Driver)
-)
+var driversMu sync.RWMutex
+
+// drivers should be an internal detail,
+// but widely used packages access it using linkname.
+// (It is extra wrong that they linkname drivers but not driversMu.)
+// Notable members of the hall of shame include:
+//   - github.com/instana/go-sensor
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname drivers
+var drivers = make(map[string]driver.Driver)
 
 // nowFunc returns the current time; it's overridden in tests.
 var nowFunc = time.Now
@@ -65,12 +76,7 @@ func unregisterAllDrivers() {
 func Drivers() []string {
 	driversMu.RLock()
 	defer driversMu.RUnlock()
-	list := make([]string, 0, len(drivers))
-	for name := range drivers {
-		list = append(list, name)
-	}
-	sort.Strings(list)
-	return list
+	return slices.Sorted(maps.Keys(drivers))
 }
 
 // A NamedArg is a named argument. NamedArg values may be used as
@@ -404,6 +410,8 @@ func (n NullTime) Value() (driver.Value, error) {
 //	} else {
 //	   // NULL value
 //	}
+//
+// T should be one of the types accepted by [driver.Value].
 type Null[T any] struct {
 	V     T
 	Valid bool
@@ -422,7 +430,17 @@ func (n Null[T]) Value() (driver.Value, error) {
 	if !n.Valid {
 		return nil, nil
 	}
-	return n.V, nil
+	v := any(n.V)
+	// See issue 69728.
+	if valuer, ok := v.(driver.Valuer); ok {
+		val, err := callValuerValue(valuer)
+		if err != nil {
+			return val, err
+		}
+		v = val
+	}
+	// See issue 69837.
+	return driver.DefaultParameterConverter.ConvertValue(v)
 }
 
 // Scanner is an interface used by [Rows.Scan].
@@ -551,9 +569,9 @@ type driverConn struct {
 
 	// guarded by db.mu
 	inUse      bool
+	dbmuClosed bool      // same as closed, but guarded by db.mu, for removeClosedStmtLocked
 	returnedAt time.Time // Time the connection was created or returned.
 	onPut      []func()  // code (with db.mu held) run when conn is next returned
-	dbmuClosed bool      // same as closed, but guarded by db.mu, for removeClosedStmtLocked
 }
 
 func (dc *driverConn) releaseConn(err error) {
@@ -1032,7 +1050,7 @@ func (db *DB) SetConnMaxLifetime(d time.Duration) {
 	}
 	db.mu.Lock()
 	// Wake cleaner up when lifetime is shortened.
-	if d > 0 && d < db.maxLifetime && db.cleanerCh != nil {
+	if d > 0 && d < db.shortestIdleTimeLocked() && db.cleanerCh != nil {
 		select {
 		case db.cleanerCh <- struct{}{}:
 		default:
@@ -1056,7 +1074,7 @@ func (db *DB) SetConnMaxIdleTime(d time.Duration) {
 	defer db.mu.Unlock()
 
 	// Wake cleaner up when idle time is shortened.
-	if d > 0 && d < db.maxIdleTime && db.cleanerCh != nil {
+	if d > 0 && d < db.shortestIdleTimeLocked() && db.cleanerCh != nil {
 		select {
 		case db.cleanerCh <- struct{}{}:
 		default:
@@ -1358,8 +1376,8 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 
 			db.waitDuration.Add(int64(time.Since(waitStart)))
 
-			// If we failed to delete it, that means something else
-			// grabbed it and is about to send on it.
+			// If we failed to delete it, that means either the DB was closed or
+			// something else grabbed it and is about to send on it.
 			if !deleted {
 				// TODO(bradfitz): rather than this best effort select, we
 				// should probably start a goroutine to read from req. This best
@@ -2684,6 +2702,8 @@ func (s *Stmt) removeClosedStmtLocked() {
 	for i := 0; i < len(s.css); i++ {
 		if s.css[i].dc.dbmuClosed {
 			s.css[i] = s.css[len(s.css)-1]
+			// Zero out the last element (for GC) before shrinking the slice.
+			s.css[len(s.css)-1] = connStmt{}
 			s.css = s.css[:len(s.css)-1]
 			i--
 		}
@@ -2921,12 +2941,8 @@ type Rows struct {
 	//
 	// closemu guards lasterr and closed.
 	closemu sync.RWMutex
-	closed  bool
 	lasterr error // non-nil only if closed is true
-
-	// lastcols is only used in Scan, Next, and NextResultSet which are expected
-	// not to be called concurrently.
-	lastcols []driver.Value
+	closed  bool
 
 	// closemuScanHold is whether the previous call to Scan kept closemu RLock'ed
 	// without unlocking it. It does that when the user passes a *RawBytes scan
@@ -2942,6 +2958,17 @@ type Rows struct {
 	// returning. It's only used by Next and Err which are
 	// expected not to be called concurrently.
 	hitEOF bool
+
+	// lastcols is only used in Scan, Next, and NextResultSet which are expected
+	// not to be called concurrently.
+	lastcols []driver.Value
+
+	// raw is a buffer for RawBytes that persists between Scan calls.
+	// This is used when the driver returns a mismatched type that requires
+	// a cloning allocation. For example, if the driver returns a *string and
+	// the user is scanning into a *RawBytes, we need to copy the string.
+	// The raw buffer here lets us reuse the memory for that copy across Scan calls.
+	raw []byte
 }
 
 // lasterrOrErrLocked returns either lasterr or the provided err.
@@ -3120,6 +3147,32 @@ func (rs *Rows) Err() error {
 	rs.closemu.RLock()
 	defer rs.closemu.RUnlock()
 	return rs.lasterrOrErrLocked(nil)
+}
+
+// rawbuf returns the buffer to append RawBytes values to.
+// This buffer is reused across calls to Rows.Scan.
+//
+// Usage:
+//
+//	rawBytes = rows.setrawbuf(append(rows.rawbuf(), value...))
+func (rs *Rows) rawbuf() []byte {
+	if rs == nil {
+		// convertAssignRows can take a nil *Rows; for simplicity handle it here
+		return nil
+	}
+	return rs.raw
+}
+
+// setrawbuf updates the RawBytes buffer with the result of appending a new value to it.
+// It returns the new value.
+func (rs *Rows) setrawbuf(b []byte) RawBytes {
+	if rs == nil {
+		// convertAssignRows can take a nil *Rows; for simplicity handle it here
+		return RawBytes(b)
+	}
+	off := len(rs.raw)
+	rs.raw = b
+	return RawBytes(rs.raw[off:])
 }
 
 var errRowsClosed = errors.New("sql: Rows are closed")
@@ -3315,37 +3368,45 @@ func (rs *Rows) Scan(dest ...any) error {
 		// without calling Next.
 		return fmt.Errorf("sql: Scan called without calling Next (closemuScanHold)")
 	}
+
 	rs.closemu.RLock()
-
-	if rs.lasterr != nil && rs.lasterr != io.EOF {
-		rs.closemu.RUnlock()
-		return rs.lasterr
-	}
-	if rs.closed {
-		err := rs.lasterrOrErrLocked(errRowsClosed)
-		rs.closemu.RUnlock()
-		return err
-	}
-
-	if scanArgsContainRawBytes(dest) {
+	rs.raw = rs.raw[:0]
+	err := rs.scanLocked(dest...)
+	if err == nil && scanArgsContainRawBytes(dest) {
 		rs.closemuScanHold = true
 	} else {
 		rs.closemu.RUnlock()
 	}
+	return err
+}
+
+func (rs *Rows) scanLocked(dest ...any) error {
+	if rs.lasterr != nil && rs.lasterr != io.EOF {
+		return rs.lasterr
+	}
+	if rs.closed {
+		return rs.lasterrOrErrLocked(errRowsClosed)
+	}
 
 	if rs.lastcols == nil {
-		rs.closemuRUnlockIfHeldByScan()
 		return errors.New("sql: Scan called without calling Next")
 	}
 	if len(dest) != len(rs.lastcols) {
-		rs.closemuRUnlockIfHeldByScan()
 		return fmt.Errorf("sql: expected %d destination arguments in Scan, not %d", len(rs.lastcols), len(dest))
 	}
 
 	for i, sv := range rs.lastcols {
-		err := convertAssignRows(dest[i], sv, rs)
+		err := driver.ErrSkip
+
+		if rcs, ok := rs.rowsi.(driver.RowsColumnScanner); ok {
+			err = rcs.ScanColumn(dest[i], i)
+		}
+
+		if err == driver.ErrSkip {
+			err = convertAssignRows(dest[i], sv, rs)
+		}
+
 		if err != nil {
-			rs.closemuRUnlockIfHeldByScan()
 			return fmt.Errorf(`sql: Scan error on column index %d, name %q: %w`, i, rs.rowsi.Columns()[i], err)
 		}
 	}
@@ -3450,10 +3511,8 @@ func (r *Row) Scan(dest ...any) error {
 	// they were obtained from the network anyway) But for now we
 	// don't care.
 	defer r.rows.Close()
-	for _, dp := range dest {
-		if _, ok := dp.(*RawBytes); ok {
-			return errors.New("sql: RawBytes isn't allowed on Row.Scan")
-		}
+	if scanArgsContainRawBytes(dest) {
+		return errors.New("sql: RawBytes isn't allowed on Row.Scan")
 	}
 
 	if !r.rows.Next() {
@@ -3550,6 +3609,7 @@ type connRequestAndIndex struct {
 // and clears the set.
 func (s *connRequestSet) CloseAndRemoveAll() {
 	for _, v := range s.s {
+		*v.curIdx = -1
 		close(v.req)
 	}
 	s.s = nil

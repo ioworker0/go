@@ -7,8 +7,8 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
-	"runtime/internal/sys"
+	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -31,7 +31,7 @@ import (
 //     poll without blocking. If delta > 0, block for up to delta nanoseconds.
 //     Return a list of goroutines built by calling netpollready,
 //     and a delta to add to netpollWaiters when all goroutines are ready.
-//     This will never return an empty list with a non-zero delta.
+//     This must never return an empty list with a non-zero delta.
 //
 // func netpollBreak()
 //     Wake up the network poller, assumed to be blocked in netpoll.
@@ -102,14 +102,14 @@ type pollDesc struct {
 
 	lock    mutex // protects the following fields
 	closing bool
+	rrun    bool      // whether rt is running
+	wrun    bool      // whether wt is running
 	user    uint32    // user settable cookie
 	rseq    uintptr   // protects from stale read timers
 	rt      timer     // read deadline timer
-	rrun    bool      // whether rt is running
 	rd      int64     // read deadline (a nanotime in the future, -1 when expired)
 	wseq    uintptr   // protects from stale write timers
 	wt      timer     // write deadline timer
-	wrun    bool      // whether wt is running
 	wd      int64     // write deadline (a nanotime in the future, -1 when expired)
 	self    *pollDesc // storage for indirect interface. See (*pollDesc).makeArg.
 }
@@ -207,6 +207,9 @@ var (
 	netpollWaiters atomic.Uint32
 )
 
+// netpollWaiters is accessed in tests
+//go:linkname netpollWaiters
+
 //go:linkname poll_runtime_pollServerInit internal/poll.runtime_pollServerInit
 func poll_runtime_pollServerInit() {
 	netpollGenericInit()
@@ -299,7 +302,7 @@ func (c *pollCache) free(pd *pollDesc) {
 	// Increment the fdseq field, so that any currently
 	// running netpoll calls will not mark pd as ready.
 	fdseq := pd.fdseq.Load()
-	fdseq = (fdseq + 1) & (1<<taggedPointerBits - 1)
+	fdseq = (fdseq + 1) & (1<<tagBits - 1)
 	pd.fdseq.Store(fdseq)
 
 	pd.publishInfo()
@@ -685,14 +688,18 @@ func netpollAdjustWaiters(delta int32) {
 func (c *pollCache) alloc() *pollDesc {
 	lock(&c.lock)
 	if c.first == nil {
-		const pdSize = unsafe.Sizeof(pollDesc{})
+		type pollDescPadded struct {
+			pollDesc
+			pad [tagAlign - unsafe.Sizeof(pollDesc{})]byte
+		}
+		const pdSize = unsafe.Sizeof(pollDescPadded{})
 		n := pollBlockSize / pdSize
 		if n == 0 {
 			n = 1
 		}
 		// Must be in non-GC memory because can be referenced
 		// only from epoll/kqueue internals.
-		mem := persistentalloc(n*pdSize, 0, &memstats.other_sys)
+		mem := persistentalloc(n*pdSize, tagAlign, &memstats.other_sys)
 		for i := uintptr(0); i < n; i++ {
 			pd := (*pollDesc)(add(mem, i*pdSize))
 			lockInit(&pd.lock, lockRankPollDesc)
@@ -711,7 +718,7 @@ func (c *pollCache) alloc() *pollDesc {
 // makeArg converts pd to an interface{}.
 // makeArg does not do any allocation. Normally, such
 // a conversion requires an allocation because pointers to
-// types which embed runtime/internal/sys.NotInHeap (which pollDesc is)
+// types which embed internal/runtime/sys.NotInHeap (which pollDesc is)
 // must be stored in interfaces indirectly. See issue 42076.
 func (pd *pollDesc) makeArg() (i any) {
 	x := (*eface)(unsafe.Pointer(&i))

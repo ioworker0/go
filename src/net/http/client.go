@@ -20,7 +20,7 @@ import (
 	"net/http/internal/ascii"
 	"net/url"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,8 +172,13 @@ func refererForURL(lastReq, newReq *url.URL, explicitRef string) string {
 
 // didTimeout is non-nil only if err != nil.
 func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+	cookieURL := req.URL
+	if req.Host != "" {
+		cookieURL = cloneURL(cookieURL)
+		cookieURL.Host = req.Host
+	}
 	if c.Jar != nil {
-		for _, cookie := range c.Jar.Cookies(req.URL) {
+		for _, cookie := range c.Jar.Cookies(cookieURL) {
 			req.AddCookie(cookie)
 		}
 	}
@@ -183,7 +188,7 @@ func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTime
 	}
 	if c.Jar != nil {
 		if rc := resp.Cookies(); len(rc) > 0 {
-			c.Jar.SetCookies(req.URL, rc)
+			c.Jar.SetCookies(cookieURL, rc)
 		}
 	}
 	return resp, nil, nil
@@ -388,15 +393,12 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 	}
 
 	stopTimerCh := make(chan struct{})
-	var once sync.Once
-	stopTimer = func() {
-		once.Do(func() {
-			close(stopTimerCh)
-			if cancelCtx != nil {
-				cancelCtx()
-			}
-		})
-	}
+	stopTimer = sync.OnceFunc(func() {
+		close(stopTimerCh)
+		if cancelCtx != nil {
+			cancelCtx()
+		}
+	})
 
 	timer := time.NewTimer(time.Until(deadline))
 	var timedOut atomic.Bool
@@ -603,6 +605,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			Err: errors.New("http: nil Request.URL"),
 		}
 	}
+	_ = *c // panic early if c is nil; see go.dev/issue/53521
 
 	var (
 		deadline      = c.deadline()
@@ -612,8 +615,9 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 		reqBodyClosed = false // have we closed the current req.Body?
 
 		// Redirect behavior:
-		redirectMethod string
-		includeBody    bool
+		redirectMethod        string
+		includeBody           = true
+		stripSensitiveHeaders = false
 	)
 	uerr := func(err error) error {
 		// the body may have been closed already by c.send()
@@ -673,6 +677,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 					resp.closeBody()
 					return nil, uerr(err)
 				}
+				req.GetBody = ireq.GetBody
 				req.ContentLength = ireq.ContentLength
 			}
 
@@ -680,8 +685,12 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			// in case the user set Referer on their first request.
 			// If they really want to override, they can do it in
 			// their CheckRedirect func.
-			copyHeaders(req)
-
+			if !stripSensitiveHeaders && reqs[0].URL.Host != req.URL.Host {
+				if !shouldCopyHeaderOnRedirect(reqs[0].URL, req.URL) {
+					stripSensitiveHeaders = true
+				}
+			}
+			copyHeaders(req, stripSensitiveHeaders, !includeBody)
 			// Add the Referer header from the most recent
 			// request URL to the new one, if it's not https->http:
 			if ref := refererForURL(reqs[len(reqs)-1].URL, req.URL, req.Header.Get("Referer")); ref != "" {
@@ -730,10 +739,15 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			return nil, uerr(err)
 		}
 
-		var shouldRedirect bool
-		redirectMethod, shouldRedirect, includeBody = redirectBehavior(req.Method, resp, reqs[0])
+		var shouldRedirect, includeBodyOnHop bool
+		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, reqs[0])
 		if !shouldRedirect {
 			return resp, nil
+		}
+		if !includeBodyOnHop {
+			// Once a hop drops the body, we never send it again
+			// (because we're now handling a redirect for a request with no body).
+			includeBody = false
 		}
 
 		req.closeBody()
@@ -743,7 +757,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 // makeHeadersCopier makes a function that copies headers from the
 // initial Request, ireq. For every redirect, this function must be called
 // so that it can copy headers into the upcoming Request.
-func (c *Client) makeHeadersCopier(ireq *Request) func(*Request) {
+func (c *Client) makeHeadersCopier(ireq *Request) func(req *Request, stripSensitiveHeaders, stripBodyHeaders bool) {
 	// The headers to copy are from the very initial request.
 	// We use a closured callback to keep a reference to these original headers.
 	var (
@@ -757,8 +771,7 @@ func (c *Client) makeHeadersCopier(ireq *Request) func(*Request) {
 		}
 	}
 
-	preq := ireq // The previous request
-	return func(req *Request) {
+	return func(req *Request, stripSensitiveHeaders, stripBodyHeaders bool) {
 		// If Jar is present and there was some initial cookies provided
 		// via the request header, then we may need to alter the initial
 		// cookies as we follow redirects since each redirect may end up
@@ -787,7 +800,7 @@ func (c *Client) makeHeadersCopier(ireq *Request) func(*Request) {
 						ss = append(ss, c.Name+"="+c.Value)
 					}
 				}
-				sort.Strings(ss) // Ensure deterministic headers
+				slices.Sort(ss) // Ensure deterministic headers
 				ireqhdr.Set("Cookie", strings.Join(ss, "; "))
 			}
 		}
@@ -795,12 +808,25 @@ func (c *Client) makeHeadersCopier(ireq *Request) func(*Request) {
 		// Copy the initial request's Header values
 		// (at least the safe ones).
 		for k, vv := range ireqhdr {
-			if shouldCopyHeaderOnRedirect(k, preq.URL, req.URL) {
+			sensitive := false
+			body := false
+			switch CanonicalHeaderKey(k) {
+			case "Authorization", "Www-Authenticate", "Cookie", "Cookie2",
+				"Proxy-Authorization", "Proxy-Authenticate":
+				sensitive = true
+
+			case "Content-Encoding", "Content-Language", "Content-Location",
+				"Content-Type":
+				// Headers relating to the body which is removed for
+				// POST to GET redirects
+				// https://fetch.spec.whatwg.org/#http-redirect-fetch
+				body = true
+
+			}
+			if !(sensitive && stripSensitiveHeaders) && !(body && stripBodyHeaders) {
 				req.Header[k] = vv
 			}
 		}
-
-		preq = req // Update previous Request with the current request
 	}
 }
 
@@ -843,7 +869,7 @@ func Post(url, contentType string, body io.Reader) (resp *Response, err error) {
 // To make a request with a specified context.Context, use [NewRequestWithContext]
 // and [Client.Do].
 //
-// See the Client.Do method documentation for details on how redirects
+// See the [Client.Do] method documentation for details on how redirects
 // are handled.
 func (c *Client) Post(url, contentType string, body io.Reader) (resp *Response, err error) {
 	req, err := NewRequest("POST", url, body)
@@ -883,7 +909,7 @@ func PostForm(url string, data url.Values) (resp *Response, err error) {
 // When err is nil, resp always contains a non-nil resp.Body.
 // Caller should close resp.Body when done reading from it.
 //
-// See the Client.Do method documentation for details on how redirects
+// See the [Client.Do] method documentation for details on how redirects
 // are handled.
 //
 // To make a request with a specified context.Context, use [NewRequestWithContext]
@@ -976,28 +1002,23 @@ func (b *cancelTimerBody) Close() error {
 	return err
 }
 
-func shouldCopyHeaderOnRedirect(headerKey string, initial, dest *url.URL) bool {
-	switch CanonicalHeaderKey(headerKey) {
-	case "Authorization", "Www-Authenticate", "Cookie", "Cookie2":
-		// Permit sending auth/cookie headers from "foo.com"
-		// to "sub.foo.com".
+func shouldCopyHeaderOnRedirect(initial, dest *url.URL) bool {
+	// Permit sending auth/cookie headers from "foo.com"
+	// to "sub.foo.com".
 
-		// Note that we don't send all cookies to subdomains
-		// automatically. This function is only used for
-		// Cookies set explicitly on the initial outgoing
-		// client request. Cookies automatically added via the
-		// CookieJar mechanism continue to follow each
-		// cookie's scope as set by Set-Cookie. But for
-		// outgoing requests with the Cookie header set
-		// directly, we don't know their scope, so we assume
-		// it's for *.domain.com.
+	// Note that we don't send all cookies to subdomains
+	// automatically. This function is only used for
+	// Cookies set explicitly on the initial outgoing
+	// client request. Cookies automatically added via the
+	// CookieJar mechanism continue to follow each
+	// cookie's scope as set by Set-Cookie. But for
+	// outgoing requests with the Cookie header set
+	// directly, we don't know their scope, so we assume
+	// it's for *.domain.com.
 
-		ihost := idnaASCIIFromURL(initial)
-		dhost := idnaASCIIFromURL(dest)
-		return isDomainOrSubdomain(dhost, ihost)
-	}
-	// All other headers are copied:
-	return true
+	ihost := idnaASCIIFromURL(initial)
+	dhost := idnaASCIIFromURL(dest)
+	return isDomainOrSubdomain(dhost, ihost)
 }
 
 // isDomainOrSubdomain reports whether sub is a subdomain (or exact

@@ -55,11 +55,11 @@ func TestTicker(t *testing.T) {
 		count, delta := test.count, test.delta
 		ticker := NewTicker(delta)
 		t0 := Now()
-		for i := 0; i < count/2; i++ {
+		for range count / 2 {
 			<-ticker.C
 		}
 		ticker.Reset(delta * 2)
-		for i := count / 2; i < count; i++ {
+		for range count - count/2 {
 			<-ticker.C
 		}
 		ticker.Stop()
@@ -114,7 +114,7 @@ func TestTeardown(t *testing.T) {
 	if testing.Short() {
 		Delta = 20 * Millisecond
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		ticker := NewTicker(Delta)
 		<-ticker.C
 		ticker.Stop()
@@ -151,9 +151,13 @@ func TestTickerResetLtZeroDuration(t *testing.T) {
 }
 
 func TestLongAdjustTimers(t *testing.T) {
-	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" || runtime.GOOS == "plan9" {
 		t.Skipf("skipping on %s - too slow", runtime.GOOS)
 	}
+	if testing.Short() && runtime.NumCPU() < 2 {
+		t.Skipf("skipping in short mode, insufficient CPUs")
+	}
+
 	t.Parallel()
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -179,7 +183,7 @@ func TestLongAdjustTimers(t *testing.T) {
 	done := make(chan bool)
 	AfterFunc(60*Second, func() { close(done) })
 
-	// Set up a queing goroutine to ping pong through the scheduler.
+	// Set up a queuing goroutine to ping pong through the scheduler.
 	inQ := make(chan func())
 	outQ := make(chan func())
 
@@ -356,14 +360,51 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 	// Windows in particular has very coarse timers so we have to
 	// wait 10ms just to make a timer go off.
 	const (
-		sched = 10 * Millisecond
-		tries = 100
+		sched      = 10 * Millisecond
+		tries      = 100
+		drainTries = 5
 	)
 
-	drain := func() {
-		select {
-		case <-C:
-		default:
+	// drain1 removes one potential stale time value
+	// from the timer/ticker channel after Reset.
+	// When using Go 1.23 sync timers/tickers, draining is never needed
+	// (that's the whole point of the sync timer/ticker change).
+	drain1 := func() {
+		for range drainTries {
+			select {
+			case <-C:
+				return
+			default:
+			}
+			Sleep(sched)
+		}
+	}
+
+	// drainAsync removes potential stale time values after Stop/Reset.
+	// When using Go 1 async timers, draining one or two values
+	// may be needed after Reset or Stop (see comments in body for details).
+	drainAsync := func() {
+		if synctimerchan {
+			// sync timers must have the right semantics without draining:
+			// there are no stale values.
+			return
+		}
+
+		// async timers can send one stale value (then the timer is disabled).
+		drain1()
+		if isTicker {
+			// async tickers can send two stale values: there may be one
+			// sitting in the channel buffer, and there may also be one
+			// send racing with the Reset/Stop+drain that arrives after
+			// the first drain1 has pulled the value out.
+			// This is rare, but it does happen on overloaded builder machines.
+			// It can also be reproduced on an M3 MacBook Pro using:
+			//
+			//	go test -c strings
+			//	stress ./strings.test &   # chew up CPU
+			//	go test -c -race time
+			//	stress -p 48 ./time.test -test.count=10 -test.run=TestChan/asynctimerchan=1/Ticker
+			drain1()
 		}
 	}
 	noTick := func() {
@@ -381,7 +422,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 		case <-C:
 			return
 		}
-		for i := 0; i < tries; i++ {
+		for range tries {
 			Sleep(sched)
 			select {
 			default:
@@ -403,7 +444,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 		if n = len(C); n == 1 {
 			return
 		}
-		for i := 0; i < tries; i++ {
+		for range tries {
 			Sleep(sched)
 			if n = len(C); n == 1 {
 				return
@@ -425,7 +466,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 		tim.Reset(1)
 		Sleep(sched)
 		if l, c := len(C), cap(C); l != 0 || c != 0 {
-			//t.Fatalf("len(C), cap(C) = %d, %d, want 0, 0", l, c)
+			// t.Fatalf("len(C), cap(C) = %d, %d, want 0, 0", l, c)
 		}
 		assertTick()
 	} else {
@@ -434,9 +475,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 		assertTick()
 		Sleep(sched)
 		tim.Reset(10000 * Second)
-		if isTicker {
-			assertTick()
-		}
+		drainAsync()
 		noTick()
 
 		// Test that len sees an immediate tick arrive
@@ -448,9 +487,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 		// Test that len sees an immediate tick arrive
 		// for Reset of timer NOT in heap.
 		tim.Stop()
-		if !synctimerchan {
-			drain()
-		}
+		drainAsync()
 		tim.Reset(1)
 		assertLen()
 		assertTick()
@@ -460,10 +497,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 	// Test that Reset does not lose the tick that should have happened.
 	Sleep(sched)
 	tim.Reset(10000 * Second)
-	if !synctimerchan && isTicker {
-		assertLen()
-		assertTick()
-	}
+	drainAsync()
 	noTick()
 
 	notDone := func(done chan bool) {
@@ -477,7 +511,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 
 	waitDone := func(done chan bool) {
 		t.Helper()
-		for i := 0; i < tries; i++ {
+		for range tries {
 			Sleep(sched)
 			select {
 			case <-done:
@@ -490,9 +524,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 
 	// Reset timer in heap (already reset above, but just in case).
 	tim.Reset(10000 * Second)
-	if !synctimerchan {
-		drain()
-	}
+	drainAsync()
 
 	// Test stop while timer in heap (because goroutine is blocked on <-C).
 	done := make(chan bool)
@@ -522,17 +554,12 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 	}
 
 	tim.Stop()
-	if isTicker || !synctimerchan {
-		t.Logf("drain")
-		drain()
-	}
+	drainAsync()
 	noTick()
 
 	// Again using select and with two goroutines waiting.
 	tim.Reset(10000 * Second)
-	if !synctimerchan {
-		drain()
-	}
+	drainAsync()
 	done = make(chan bool, 2)
 	done1 := make(chan bool)
 	done2 := make(chan bool)
@@ -580,7 +607,7 @@ func testTimerChan(t *testing.T, tim timer, C <-chan Time, synctimerchan bool) {
 	// Test enqueueTimerChan when timer is stopped.
 	stop = make(chan bool)
 	done = make(chan bool, 2)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		go func() {
 			select {
 			case <-C:
@@ -641,7 +668,7 @@ func TestAfterTimes(t *testing.T) {
 	// Make sure it does.
 	// To avoid flakes due to very long scheduling delays,
 	// require 10 failures in a row before deciding something is wrong.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		start := Now()
 		c := After(10 * Millisecond)
 		Sleep(500 * Millisecond)
@@ -657,7 +684,7 @@ func TestAfterTimes(t *testing.T) {
 func TestTickTimes(t *testing.T) {
 	t.Parallel()
 	// See comment in TestAfterTimes
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		start := Now()
 		c := Tick(10 * Millisecond)
 		Sleep(500 * Millisecond)

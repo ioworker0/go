@@ -145,7 +145,7 @@ func checkFunc(f *Func) {
 					f.Fatalf("bad int32 AuxInt value for %v", v)
 				}
 				canHaveAuxInt = true
-			case auxInt64, auxARM64BitField:
+			case auxInt64, auxARM64BitField, auxARM64ConditionalParams:
 				canHaveAuxInt = true
 			case auxInt128:
 				// AuxInt must be zero, so leave canHaveAuxInt set to false.
@@ -214,6 +214,9 @@ func checkFunc(f *Func) {
 				if v.AuxInt < 0 || v.AuxInt > 15 {
 					f.Fatalf("bad FlagConstant AuxInt value for %v", v)
 				}
+				canHaveAuxInt = true
+			case auxPanicBoundsC, auxPanicBoundsCC:
+				canHaveAux = true
 				canHaveAuxInt = true
 			default:
 				f.Fatalf("unknown aux type for %s", v.Op)
@@ -314,8 +317,9 @@ func checkFunc(f *Func) {
 					f.Fatalf("bad arg 1 type to %s: want integer, have %s", v.Op, v.Args[1].LongString())
 				}
 			case OpVarDef:
-				if !v.Aux.(*ir.Name).Type().HasPointers() {
-					f.Fatalf("vardef must have pointer type %s", v.Aux.(*ir.Name).Type().String())
+				n := v.Aux.(*ir.Name)
+				if !n.Type().HasPointers() && !IsMergeCandidate(n) {
+					f.Fatalf("vardef must be merge candidate or have pointer type %s", v.Aux.(*ir.Name).Type().String())
 				}
 			case OpNilCheck:
 				// nil checks have pointer type before scheduling, and

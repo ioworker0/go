@@ -63,12 +63,12 @@ func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc) {
 			switch p.To.Sym.Name {
 			case "go_args_stackmap":
 				if p.From.Type != TYPE_CONST || p.From.Offset != abi.FUNCDATA_ArgsPointerMaps {
-					ctxt.Diag("%s: FUNCDATA use of go_args_stackmap(SB) without FUNCDATA_ArgsPointerMaps", p.Pos)
+					ctxt.Diag("%v: FUNCDATA use of go_args_stackmap(SB) without FUNCDATA_ArgsPointerMaps", p)
 				}
 				p.To.Sym = ctxt.LookupDerived(curtext, curtext.Name+".args_stackmap")
 			case "no_pointers_stackmap":
 				if p.From.Type != TYPE_CONST || p.From.Offset != abi.FUNCDATA_LocalsPointerMaps {
-					ctxt.Diag("%s: FUNCDATA use of no_pointers_stackmap(SB) without FUNCDATA_LocalsPointerMaps", p.Pos)
+					ctxt.Diag("%v: FUNCDATA use of no_pointers_stackmap(SB) without FUNCDATA_LocalsPointerMaps", p)
 				}
 				// funcdata for functions with no local variables in frame.
 				// Define two zero-length bitmaps, because the same index is used
@@ -213,6 +213,7 @@ func (ctxt *Link) InitTextSym(s *LSym, flag int, start src.XPos) {
 	s.Set(AttrNoFrame, flag&NOFRAME != 0)
 	s.Set(AttrPkgInit, flag&PKGINIT != 0)
 	s.Type = objabi.STEXT
+	s.setFIPSType(ctxt)
 	ctxt.Text = append(ctxt.Text, s)
 
 	// Set up DWARF entries for s
@@ -250,7 +251,7 @@ func (ctxt *Link) GloblPos(s *LSym, size int64, flag int, pos src.XPos) {
 	if flag&RODATA != 0 {
 		s.Type = objabi.SRODATA
 	} else if flag&NOPTR != 0 {
-		if s.Type == objabi.SDATA {
+		if s.Type.IsDATA() {
 			s.Type = objabi.SNOPTRDATA
 		} else {
 			s.Type = objabi.SNOPTRBSS
@@ -258,6 +259,7 @@ func (ctxt *Link) GloblPos(s *LSym, size int64, flag int, pos src.XPos) {
 	} else if flag&TLSBSS != 0 {
 		s.Type = objabi.STLSBSS
 	}
+	s.setFIPSType(ctxt)
 }
 
 // EmitEntryLiveness generates PCDATA Progs after p to switch to the

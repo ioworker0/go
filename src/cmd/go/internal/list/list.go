@@ -300,8 +300,8 @@ space-separated version list.
 
 The -retracted flag causes list to report information about retracted
 module versions. When -retracted is used with -f or -json, the Retracted
-field will be set to a string explaining why the version was retracted.
-The string is taken from comments on the retract directive in the
+field explains why the version was retracted.
+The strings are taken from comments on the retract directive in the
 module's go.mod file. When -retracted is used with -versions, retracted
 versions are listed together with unretracted versions. The -retracted
 flag may be used with or without -m.
@@ -345,10 +345,9 @@ For more about modules, see https://golang.org/ref/mod.
 
 func init() {
 	CmdList.Run = runList // break init cycle
-	work.AddBuildFlags(CmdList, work.DefaultBuildFlags)
-	if cfg.Experiment != nil && cfg.Experiment.CoverageRedesign {
-		work.AddCoverFlags(CmdList, nil)
-	}
+	// Omit build -json because list has its own -json
+	work.AddBuildFlags(CmdList, work.OmitJSONFlag)
+	work.AddCoverFlags(CmdList, nil)
 	CmdList.Flag.Var(&listJsonFields, "json", "")
 }
 
@@ -382,14 +381,14 @@ func (v *jsonFlag) Set(s string) error {
 	if *v == nil {
 		*v = make(map[string]bool)
 	}
-	for _, f := range strings.Split(s, ",") {
+	for f := range strings.SplitSeq(s, ",") {
 		(*v)[f] = true
 	}
 	return nil
 }
 
 func (v *jsonFlag) String() string {
-	var fields []string
+	fields := make([]string, 0, len(*v))
 	for f := range *v {
 		fields = append(fields, f)
 	}
@@ -420,7 +419,8 @@ func (v *jsonFlag) needAny(fields ...string) bool {
 var nl = []byte{'\n'}
 
 func runList(ctx context.Context, cmd *base.Command, args []string) {
-	modload.InitWorkfile()
+	moduleLoaderState := modload.NewState()
+	modload.InitWorkfile(moduleLoaderState)
 
 	if *listFmt != "" && listJson {
 		base.Fatalf("go list -f cannot be used with -json")
@@ -428,11 +428,11 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 	if *listReuse != "" && !*listM {
 		base.Fatalf("go list -reuse cannot be used without -m")
 	}
-	if *listReuse != "" && modload.HasModRoot() {
+	if *listReuse != "" && modload.HasModRoot(moduleLoaderState) {
 		base.Fatalf("go list -reuse cannot be used inside a module")
 	}
 
-	work.BuildInit()
+	work.BuildInit(moduleLoaderState)
 	out := newTrackingWriter(os.Stdout)
 	defer out.w.Flush()
 
@@ -480,7 +480,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		fm := template.FuncMap{
 			"join":    strings.Join,
 			"context": context,
-			"module":  func(path string) *modinfo.ModulePublic { return modload.ModuleInfo(ctx, path) },
+			"module":  func(path string) *modinfo.ModulePublic { return modload.ModuleInfo(moduleLoaderState, ctx, path) },
 		}
 		tmpl, err := template.New("main").Funcs(fm).Parse(*listFmt)
 		if err != nil {
@@ -497,12 +497,12 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		}
 	}
 
-	modload.Init()
+	modload.Init(moduleLoaderState)
 	if *listRetracted {
 		if cfg.BuildMod == "vendor" {
 			base.Fatalf("go list -retracted cannot be used when vendoring is enabled")
 		}
-		if !modload.Enabled() {
+		if !modload.Enabled(moduleLoaderState) {
 			base.Fatalf("go list -retracted can only be used in module-aware mode")
 		}
 	}
@@ -526,11 +526,11 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 			base.Fatalf("go list -test cannot be used with -m")
 		}
 
-		if modload.Init(); !modload.Enabled() {
+		if modload.Init(moduleLoaderState); !modload.Enabled(moduleLoaderState) {
 			base.Fatalf("go: list -m cannot be used with GO111MODULE=off")
 		}
 
-		modload.LoadModFile(ctx) // Sets cfg.BuildMod as a side-effect.
+		modload.LoadModFile(moduleLoaderState, ctx) // Sets cfg.BuildMod as a side-effect.
 		if cfg.BuildMod == "vendor" {
 			const actionDisabledFormat = "go: can't %s using the vendor directory\n\t(Use -mod=mod or -mod=readonly to bypass.)"
 
@@ -570,7 +570,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		if *listReuse != "" && len(args) == 0 {
 			base.Fatalf("go: list -m -reuse only has an effect with module@version arguments")
 		}
-		mods, err := modload.ListModules(ctx, args, mode, *listReuse)
+		mods, err := modload.ListModules(moduleLoaderState, ctx, args, mode, *listReuse)
 		if !*listE {
 			for _, m := range mods {
 				if m.Error != nil {
@@ -614,7 +614,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		SuppressBuildInfo:  !*listExport && !listJsonFields.needAny("Stale", "StaleReason"),
 		SuppressEmbedFiles: !*listExport && !listJsonFields.needAny("EmbedFiles", "TestEmbedFiles", "XTestEmbedFiles"),
 	}
-	pkgs := load.PackagesAndErrors(ctx, pkgOpts, args)
+	pkgs := load.PackagesAndErrors(moduleLoaderState, ctx, pkgOpts, args)
 	if !*listE {
 		w := 0
 		for _, pkg := range pkgs {
@@ -642,7 +642,6 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		for _, p := range pkgs {
 			if len(p.TestGoFiles)+len(p.XTestGoFiles) > 0 {
 				var pmain, ptest, pxtest *load.Package
-				var err error
 				if *listE {
 					sema.Acquire(ctx, 1)
 					wg.Add(1)
@@ -650,11 +649,12 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 						sema.Release(1)
 						wg.Done()
 					}
-					pmain, ptest, pxtest = load.TestPackagesAndErrors(ctx, done, pkgOpts, p, nil)
+					pmain, ptest, pxtest = load.TestPackagesAndErrors(moduleLoaderState, ctx, done, pkgOpts, p, nil)
 				} else {
-					pmain, ptest, pxtest, err = load.TestPackagesFor(ctx, pkgOpts, p, nil)
-					if err != nil {
-						base.Fatalf("go: can't load test package: %s", err)
+					var perr *load.Package
+					pmain, ptest, pxtest, perr = load.TestPackagesFor(moduleLoaderState, ctx, pkgOpts, p, nil)
+					if perr != nil {
+						base.Fatalf("go: can't load test package: %s", perr.Error)
 					}
 				}
 				testPackages = append(testPackages, testPackageSet{p, pmain, ptest, pxtest})
@@ -714,7 +714,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 	// Do we need to run a build to gather information?
 	needStale := (listJson && listJsonFields.needAny("Stale", "StaleReason")) || strings.Contains(*listFmt, ".Stale")
 	if needStale || *listExport || *listCompiled {
-		b := work.NewBuilder("")
+		b := work.NewBuilder("", moduleLoaderState.VendorDirOrEmpty)
 		if *listE {
 			b.AllowErrors = true
 		}
@@ -727,14 +727,14 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		b.IsCmdList = true
 		b.NeedExport = *listExport
 		b.NeedCompiledGoFiles = *listCompiled
-		if cfg.Experiment.CoverageRedesign && cfg.BuildCover {
-			load.PrepareForCoverageBuild(pkgs)
+		if cfg.BuildCover {
+			load.PrepareForCoverageBuild(moduleLoaderState, pkgs)
 		}
 		a := &work.Action{}
 		// TODO: Use pkgsFilter?
 		for _, p := range pkgs {
 			if len(p.GoFiles)+len(p.CgoFiles) > 0 {
-				a.Deps = append(a.Deps, b.AutoAction(work.ModeInstall, work.ModeInstall, p))
+				a.Deps = append(a.Deps, b.AutoAction(moduleLoaderState, work.ModeInstall, work.ModeInstall, p))
 			}
 		}
 		b.Do(ctx, a)
@@ -742,8 +742,8 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 
 	for _, p := range pkgs {
 		// Show vendor-expanded paths in listing
-		p.TestImports = p.Resolve(p.TestImports)
-		p.XTestImports = p.Resolve(p.XTestImports)
+		p.TestImports = p.Resolve(moduleLoaderState, p.TestImports)
+		p.XTestImports = p.Resolve(moduleLoaderState, p.XTestImports)
 		p.DepOnly = !cmdline[p]
 
 		if *listCompiled {
@@ -851,7 +851,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 			if *listRetracted {
 				mode |= modload.ListRetracted
 			}
-			rmods, err := modload.ListModules(ctx, args, mode, *listReuse)
+			rmods, err := modload.ListModules(moduleLoaderState, ctx, args, mode, *listReuse)
 			if err != nil && !*listE {
 				base.Error(err)
 			}
@@ -931,7 +931,7 @@ func collectDeps(p *load.Package) {
 	sort.Strings(p.Deps)
 }
 
-// collectDeps populates p.DepsErrors by iterating over p.Internal.Imports.
+// collectDepsErrors populates p.DepsErrors by iterating over p.Internal.Imports.
 // collectDepsErrors must be called on all of p's Imports before being called on p.
 func collectDepsErrors(p *load.Package) {
 	depsErrors := make(map[*load.PackageError]bool)
@@ -967,7 +967,7 @@ func collectDepsErrors(p *load.Package) {
 			return false
 		}
 		pathi, pathj := stki[len(stki)-1], stkj[len(stkj)-1]
-		return pathi < pathj
+		return pathi.Pkg < pathj.Pkg
 	})
 }
 

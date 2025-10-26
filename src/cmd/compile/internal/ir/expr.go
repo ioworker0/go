@@ -24,12 +24,12 @@ type Expr interface {
 // A miniExpr is a miniNode with extra fields common to expressions.
 // TODO(rsc): Once we are sure about the contents, compact the bools
 // into a bit field and leave extra bits available for implementations
-// embedding miniExpr. Right now there are ~60 unused bits sitting here.
+// embedding miniExpr. Right now there are ~24 unused bits sitting here.
 type miniExpr struct {
 	miniNode
+	flags bitset8
 	typ   *types.Type
 	init  Nodes // TODO(rsc): Don't require every Node to have an init
-	flags bitset8
 }
 
 const (
@@ -211,9 +211,9 @@ func (n *CallExpr) SetOp(op Op) {
 	case OAPPEND,
 		OCALL, OCALLFUNC, OCALLINTER, OCALLMETH,
 		ODELETE,
-		OGETG, OGETCALLERPC, OGETCALLERSP,
+		OGETG, OGETCALLERSP,
 		OMAKE, OMAX, OMIN, OPRINT, OPRINTLN,
-		ORECOVER, ORECOVERFP:
+		ORECOVER:
 		n.op = op
 	}
 }
@@ -617,7 +617,7 @@ func (o Op) IsSlice3() bool {
 	return false
 }
 
-// A SliceHeader expression constructs a slice header from its parts.
+// A SliceHeaderExpr constructs a slice header from its parts.
 type SliceHeaderExpr struct {
 	miniExpr
 	Ptr Node
@@ -665,7 +665,7 @@ func NewStarExpr(pos src.XPos, x Node) *StarExpr {
 func (n *StarExpr) Implicit() bool     { return n.flags&miniExprImplicit != 0 }
 func (n *StarExpr) SetImplicit(b bool) { n.flags.set(miniExprImplicit, b) }
 
-// A TypeAssertionExpr is a selector expression X.(Type).
+// A TypeAssertExpr is a selector expression X.(Type).
 // Before type-checking, the type is Ntype.
 type TypeAssertExpr struct {
 	miniExpr
@@ -677,6 +677,11 @@ type TypeAssertExpr struct {
 
 	// An internal/abi.TypeAssert descriptor to pass to the runtime.
 	Descriptor *obj.LSym
+
+	// When set to true, if this assert would panic, then use a nil pointer panic
+	// instead of an interface conversion panic.
+	// It must not be set for type asserts using the commaok form.
+	UseNilPanic bool
 }
 
 func NewTypeAssertExpr(pos src.XPos, x Node, typ *types.Type) *TypeAssertExpr {
@@ -854,15 +859,25 @@ func IsAddressable(n Node) bool {
 //
 // calling StaticValue on the "int(y)" expression returns the outer
 // "g()" expression.
+//
+// NOTE: StaticValue can return a result with a different type than
+// n's type because it can traverse through OCONVNOP operations.
+// TODO: consider reapplying OCONVNOP operations to the result. See https://go.dev/cl/676517.
 func StaticValue(n Node) Node {
 	for {
-		if n.Op() == OCONVNOP {
-			n = n.(*ConvExpr).X
-			continue
-		}
-
-		if n.Op() == OINLCALL {
-			n = n.(*InlinedCallExpr).SingleResult()
+		switch n1 := n.(type) {
+		case *ConvExpr:
+			if n1.Op() == OCONVNOP {
+				n = n1.X
+				continue
+			}
+		case *InlinedCallExpr:
+			if n1.Op() == OINLCALL {
+				n = n1.SingleResult()
+				continue
+			}
+		case *ParenExpr:
+			n = n1.X
 			continue
 		}
 
@@ -902,12 +917,12 @@ FindRHS:
 				break FindRHS
 			}
 		}
-		base.Fatalf("%v missing from LHS of %v", n, defn)
+		base.FatalfAt(defn.Pos(), "%v missing from LHS of %v", n, defn)
 	default:
 		return nil
 	}
 	if rhs == nil {
-		base.Fatalf("RHS is nil: %v", defn)
+		base.FatalfAt(defn.Pos(), "RHS is nil: %v", defn)
 	}
 
 	if Reassigned(n) {

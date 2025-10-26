@@ -4,7 +4,7 @@
 
 //go:build ignore
 
-// Generate builtinlist.go from cmd/compile/internal/typecheck/builtin/runtime.go.
+// Generate builtinlist.go from cmd/compile/internal/typecheck/_builtin/runtime.go.
 
 package main
 
@@ -78,7 +78,7 @@ func mkbuiltin(w io.Writer) {
 				continue
 			}
 			if decl.Tok != token.VAR {
-				log.Fatal("unhandled declaration kind", decl.Tok)
+				log.Fatal("unhandled declaration kind: ", decl.Tok)
 			}
 			for _, spec := range decl.Specs {
 				spec := spec.(*ast.ValueSpec)
@@ -92,7 +92,7 @@ func mkbuiltin(w io.Writer) {
 				}
 			}
 		default:
-			log.Fatal("unhandled decl type", decl)
+			log.Fatal("unhandled decl type: ", decl)
 		}
 	}
 

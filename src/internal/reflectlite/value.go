@@ -43,17 +43,19 @@ type Value struct {
 	ptr unsafe.Pointer
 
 	// flag holds metadata about the value.
-	// The lowest bits are flag bits:
+	//
+	// The lowest five bits give the Kind of the value, mirroring typ.Kind().
+	//
+	// The next set of bits are flag bits:
 	//	- flagStickyRO: obtained via unexported not embedded field, so read-only
 	//	- flagEmbedRO: obtained via unexported embedded field, so read-only
 	//	- flagIndir: val holds a pointer to the data
-	//	- flagAddr: v.CanAddr is true (implies flagIndir)
-	// Value cannot represent method values.
-	// The next five bits give the Kind of the value.
-	// This repeats typ.Kind() except for method values.
-	// The remaining 23+ bits give a method number for method values.
+	//	- flagAddr: v.CanAddr is true (implies flagIndir and ptr is non-nil)
+	//	- flagMethod: v is a method value.
+	// If !typ.IsDirectIface(), code can assume that flagIndir is set.
+	//
+	// The remaining 22+ bits give a method number for method values.
 	// If flag.kind() != Func, code can assume that flagMethod is unset.
-	// If ifaceIndir(typ), code can assume that flagIndir is set.
 	flag
 
 	// A method value represents a curried method invocation
@@ -94,7 +96,7 @@ func (v Value) typ() *abi.Type {
 	// types, held in the central map). So there is no need to
 	// escape types. noescape here help avoid unnecessary escape
 	// of v.
-	return (*abi.Type)(noescape(unsafe.Pointer(v.typ_)))
+	return (*abi.Type)(abi.NoEscape(unsafe.Pointer(v.typ_)))
 }
 
 // pointer returns the underlying pointer represented by v.
@@ -113,10 +115,10 @@ func (v Value) pointer() unsafe.Pointer {
 func packEface(v Value) any {
 	t := v.typ()
 	var i any
-	e := (*emptyInterface)(unsafe.Pointer(&i))
+	e := (*abi.EmptyInterface)(unsafe.Pointer(&i))
 	// First, fill in the data portion of the interface.
 	switch {
-	case ifaceIndir(t):
+	case !t.IsDirectIface():
 		if v.flag&flagIndir == 0 {
 			panic("bad indir")
 		}
@@ -127,36 +129,36 @@ func packEface(v Value) any {
 			typedmemmove(t, c, ptr)
 			ptr = c
 		}
-		e.word = ptr
+		e.Data = ptr
 	case v.flag&flagIndir != 0:
 		// Value is indirect, but interface is direct. We need
 		// to load the data at v.ptr into the interface data word.
-		e.word = *(*unsafe.Pointer)(v.ptr)
+		e.Data = *(*unsafe.Pointer)(v.ptr)
 	default:
 		// Value is direct, and so is the interface.
-		e.word = v.ptr
+		e.Data = v.ptr
 	}
 	// Now, fill in the type portion. We're very careful here not
 	// to have any operation between the e.word and e.typ assignments
 	// that would let the garbage collector observe the partially-built
 	// interface value.
-	e.typ = t
+	e.Type = t
 	return i
 }
 
 // unpackEface converts the empty interface i to a Value.
 func unpackEface(i any) Value {
-	e := (*emptyInterface)(unsafe.Pointer(&i))
+	e := (*abi.EmptyInterface)(unsafe.Pointer(&i))
 	// NOTE: don't read e.word until we know whether it is really a pointer or not.
-	t := e.typ
+	t := e.Type
 	if t == nil {
 		return Value{}
 	}
 	f := flag(t.Kind())
-	if ifaceIndir(t) {
+	if !t.IsDirectIface() {
 		f |= flagIndir
 	}
-	return Value{t, e.word, f}
+	return Value{t, e.Data, f}
 }
 
 // A ValueError occurs when a Value method is invoked on
@@ -183,12 +185,6 @@ func methodName() string {
 		return "unknown method"
 	}
 	return f.Name()
-}
-
-// emptyInterface is the header for an interface{} value.
-type emptyInterface struct {
-	typ  *abi.Type
-	word unsafe.Pointer
 }
 
 // mustBeExported panics if f records that the value was obtained using
@@ -481,10 +477,4 @@ func escapes(x any) {
 var dummy struct {
 	b bool
 	x any
-}
-
-//go:nosplit
-func noescape(p unsafe.Pointer) unsafe.Pointer {
-	x := uintptr(p)
-	return unsafe.Pointer(x ^ 0)
 }

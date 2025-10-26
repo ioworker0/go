@@ -7,6 +7,7 @@ package ssa
 import (
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 )
 
 // dse does dead-store elimination on the Function.
@@ -21,12 +22,15 @@ func dse(f *Func) {
 	defer f.retSparseSet(storeUse)
 	shadowed := f.newSparseMap(f.NumValues())
 	defer f.retSparseMap(shadowed)
+	// localAddrs maps from a local variable (the Aux field of a LocalAddr value) to an instance of a LocalAddr value for that variable in the current block.
+	localAddrs := map[any]*Value{}
 	for _, b := range f.Blocks {
 		// Find all the stores in this block. Categorize their uses:
 		//  loadUse contains stores which are used by a subsequent load.
 		//  storeUse contains stores which are used by a subsequent store.
 		loadUse.clear()
 		storeUse.clear()
+		clear(localAddrs)
 		stores = stores[:0]
 		for _, v := range b.Values {
 			if v.Op == OpPhi {
@@ -46,6 +50,16 @@ func dse(f *Func) {
 					}
 				}
 			} else {
+				if v.Op == OpLocalAddr {
+					if _, ok := localAddrs[v.Aux]; !ok {
+						localAddrs[v.Aux] = v
+					}
+					continue
+				}
+				if v.Op == OpInlMark || v.Op == OpConvert {
+					// Not really a use of the memory. See #67957.
+					continue
+				}
 				for _, a := range v.Args {
 					if a.Block == b && a.Type.IsMemory() {
 						loadUse.add(a.ID)
@@ -100,7 +114,13 @@ func dse(f *Func) {
 			} else { // OpZero
 				sz = v.AuxInt
 			}
-			sr := shadowRange(shadowed.get(ptr.ID))
+			if ptr.Op == OpLocalAddr {
+				if la, ok := localAddrs[ptr.Aux]; ok {
+					ptr = la
+				}
+			}
+			srNum, _ := shadowed.get(ptr.ID)
+			sr := shadowRange(srNum)
 			if sr.contains(off, off+sz) {
 				// Modify the store/zero into a copy of the memory state,
 				// effectively eliding the store operation.
@@ -138,14 +158,13 @@ func dse(f *Func) {
 
 // A shadowRange encodes a set of byte offsets [lo():hi()] from
 // a given pointer that will be written to later in the block.
-// A zero shadowRange encodes an empty shadowed range (and so
-// does a -1 shadowRange, which is what sparsemap.get returns
-// on a failed lookup).
+// A zero shadowRange encodes an empty shadowed range.
 type shadowRange int32
 
 func (sr shadowRange) lo() int64 {
 	return int64(sr & 0xffff)
 }
+
 func (sr shadowRange) hi() int64 {
 	return int64((sr >> 16) & 0xffff)
 }
@@ -195,7 +214,7 @@ func elimDeadAutosGeneric(f *Func) {
 		case OpAddr, OpLocalAddr:
 			// Propagate the address if it points to an auto.
 			n, ok := v.Aux.(*ir.Name)
-			if !ok || n.Class != ir.PAUTO {
+			if !ok || (n.Class != ir.PAUTO && !isABIInternalParam(f, n)) {
 				return
 			}
 			if addr[v] == nil {
@@ -206,7 +225,7 @@ func elimDeadAutosGeneric(f *Func) {
 		case OpVarDef:
 			// v should be eliminated if we eliminate the auto.
 			n, ok := v.Aux.(*ir.Name)
-			if !ok || n.Class != ir.PAUTO {
+			if !ok || (n.Class != ir.PAUTO && !isABIInternalParam(f, n)) {
 				return
 			}
 			if elim[v] == nil {
@@ -222,7 +241,7 @@ func elimDeadAutosGeneric(f *Func) {
 			// may not be used by the inline code, but will be used by
 			// panic processing).
 			n, ok := v.Aux.(*ir.Name)
-			if !ok || n.Class != ir.PAUTO {
+			if !ok || (n.Class != ir.PAUTO && !isABIInternalParam(f, n)) {
 				return
 			}
 			if !used.Has(n) {
@@ -355,7 +374,7 @@ func elimUnreadAutos(f *Func) {
 			if !ok {
 				continue
 			}
-			if n.Class != ir.PAUTO {
+			if n.Class != ir.PAUTO && !isABIInternalParam(f, n) {
 				continue
 			}
 
@@ -394,4 +413,17 @@ func elimUnreadAutos(f *Func) {
 		store.AuxInt = 0
 		store.Op = OpCopy
 	}
+}
+
+// isABIInternalParam returns whether n is a parameter of an ABIInternal
+// function. For dead store elimination, we can treat parameters the same
+// way as autos. Storing to a parameter can be removed if it is not read
+// or address-taken.
+//
+// We check ABI here because for a cgo_unsafe_arg function (which is ABI0),
+// all the args are effectively address-taken, but not necessarily have
+// an Addr or LocalAddr op. We could probably just check for cgo_unsafe_arg,
+// but ABIInternal is mostly what matters.
+func isABIInternalParam(f *Func, n *ir.Name) bool {
+	return n.Class == ir.PPARAM && f.ABISelf.Which() == obj.ABIInternal
 }

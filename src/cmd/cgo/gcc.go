@@ -24,8 +24,10 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 
@@ -58,17 +60,17 @@ func cname(s string) string {
 		return t
 	}
 
-	if strings.HasPrefix(s, "struct_") {
-		return "struct " + s[len("struct_"):]
+	if t, ok := strings.CutPrefix(s, "struct_"); ok {
+		return "struct " + t
 	}
-	if strings.HasPrefix(s, "union_") {
-		return "union " + s[len("union_"):]
+	if t, ok := strings.CutPrefix(s, "union_"); ok {
+		return "union " + t
 	}
-	if strings.HasPrefix(s, "enum_") {
-		return "enum " + s[len("enum_"):]
+	if t, ok := strings.CutPrefix(s, "enum_"); ok {
+		return "enum " + t
 	}
-	if strings.HasPrefix(s, "sizeof_") {
-		return "sizeof(" + cname(s[len("sizeof_"):]) + ")"
+	if t, ok := strings.CutPrefix(s, "sizeof_"); ok {
+		return "sizeof(" + cname(t) + ")"
 	}
 	return s
 }
@@ -94,10 +96,8 @@ func (f *File) ProcessCgoDirectives() {
 				directive := fields[1]
 				funcName := fields[2]
 				if directive == "nocallback" {
-					fatalf("#cgo nocallback disabled until Go 1.23")
 					f.NoCallbacks[funcName] = true
 				} else if directive == "noescape" {
-					fatalf("#cgo noescape disabled until Go 1.23")
 					f.NoEscapes[funcName] = true
 				}
 			}
@@ -183,26 +183,22 @@ func splitQuoted(s string) (r []string, err error) {
 	return args, err
 }
 
-// Translate rewrites f.AST, the original Go input, to remove
-// references to the imported package C, replacing them with
-// references to the equivalent Go types, functions, and variables.
-func (p *Package) Translate(f *File) {
+// loadDebug runs gcc to load debug information for the File. The debug
+// information will be saved to the debugs field of the file, and be
+// processed when Translate is called on the file later.
+// loadDebug is called concurrently with different files.
+func (f *File) loadDebug(p *Package) {
 	for _, cref := range f.Ref {
 		// Convert C.ulong to C.unsigned long, etc.
 		cref.Name.C = cname(cref.Name.Go)
 	}
 
-	var conv typeConv
-	conv.Init(p.PtrSize, p.IntSize)
-
-	p.loadDefines(f)
-	p.typedefs = map[string]bool{}
-	p.typedefList = nil
+	ft := fileTypedefs{typedefs: make(map[string]bool)}
 	numTypedefs := -1
-	for len(p.typedefs) > numTypedefs {
-		numTypedefs = len(p.typedefs)
+	for len(ft.typedefs) > numTypedefs {
+		numTypedefs = len(ft.typedefs)
 		// Also ask about any typedefs we've seen so far.
-		for _, info := range p.typedefList {
+		for _, info := range ft.typedefList {
 			if f.Name[info.typedef] != nil {
 				continue
 			}
@@ -215,7 +211,7 @@ func (p *Package) Translate(f *File) {
 		}
 		needType := p.guessKinds(f)
 		if len(needType) > 0 {
-			p.loadDWARF(f, &conv, needType)
+			f.debugs = append(f.debugs, p.loadDWARF(f, &ft, needType))
 		}
 
 		// In godefs mode we're OK with the typedefs, which
@@ -224,6 +220,18 @@ func (p *Package) Translate(f *File) {
 		if *godefs {
 			break
 		}
+	}
+}
+
+// Translate rewrites f.AST, the original Go input, to remove
+// references to the imported package C, replacing them with
+// references to the equivalent Go types, functions, and variables.
+// Preconditions: File.loadDebug must be called prior to translate.
+func (p *Package) Translate(f *File) {
+	var conv typeConv
+	conv.Init(p.PtrSize, p.IntSize)
+	for _, d := range f.debugs {
+		p.recordTypes(f, d, &conv)
 	}
 	p.prepareNames(f)
 	if p.rewriteCalls(f) {
@@ -235,13 +243,15 @@ func (p *Package) Translate(f *File) {
 
 // loadDefines coerces gcc into spitting out the #defines in use
 // in the file f and saves relevant renamings in f.Name[name].Define.
-func (p *Package) loadDefines(f *File) {
+// Returns true if env:CC is Clang
+func (f *File) loadDefines(gccOptions []string) bool {
 	var b bytes.Buffer
 	b.WriteString(builtinProlog)
 	b.WriteString(f.Preamble)
-	stdout := p.gccDefines(b.Bytes())
+	stdout := gccDefines(b.Bytes(), gccOptions)
 
-	for _, line := range strings.Split(stdout, "\n") {
+	var gccIsClang bool
+	for line := range strings.SplitSeq(stdout, "\n") {
 		if len(line) < 9 || line[0:7] != "#define" {
 			continue
 		}
@@ -263,7 +273,7 @@ func (p *Package) loadDefines(f *File) {
 		}
 
 		if key == "__clang__" {
-			p.GccIsClang = true
+			gccIsClang = true
 		}
 
 		if n := f.Name[key]; n != nil {
@@ -273,11 +283,13 @@ func (p *Package) loadDefines(f *File) {
 			n.Define = val
 		}
 	}
+	return gccIsClang
 }
 
 // guessKinds tricks gcc into revealing the kind of each
 // name xxx for the references C.xxx in the Go input.
 // The kind is either a constant, type, or variable.
+// guessKinds is called concurrently with different files.
 func (p *Package) guessKinds(f *File) []*Name {
 	// Determine kinds for names we already know about,
 	// like #defines or 'struct foo', before bothering with gcc.
@@ -416,7 +428,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 		notDeclared
 	)
 	sawUnmatchedErrors := false
-	for _, line := range strings.Split(stderr, "\n") {
+	for line := range strings.SplitSeq(stderr, "\n") {
 		// Ignore warnings and random comments, with one
 		// exception: newer GCC versions will sometimes emit
 		// an error on a macro #define with a note referring
@@ -489,7 +501,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 				// Don't report an error, and skip adding n to the needType array.
 				continue
 			}
-			error_(f.NamePos[n], "could not determine kind of name for C.%s", fixGo(n.Go))
+			error_(f.NamePos[n], "could not determine what C.%s refers to", fixGo(n.Go))
 		case notStrLiteral | notType:
 			n.Kind = "iconst"
 		case notIntConst | notStrLiteral | notType:
@@ -521,7 +533,8 @@ func (p *Package) guessKinds(f *File) []*Name {
 // loadDWARF parses the DWARF debug information generated
 // by gcc to learn the details of the constants, variables, and types
 // being referred to as C.xxx.
-func (p *Package) loadDWARF(f *File, conv *typeConv, names []*Name) {
+// loadDwarf is called concurrently with different files.
+func (p *Package) loadDWARF(f *File, ft *fileTypedefs, names []*Name) *debug {
 	// Extract the types from the DWARF section of an object
 	// from a well-formed C program. Gcc only generates DWARF info
 	// for symbols in the object file, so it is not enough to print the
@@ -635,12 +648,27 @@ func (p *Package) loadDWARF(f *File, conv *typeConv, names []*Name) {
 				fatalf("malformed __cgo__ name: %s", name)
 			}
 			types[i] = t.Type
-			p.recordTypedefs(t.Type, f.NamePos[names[i]])
+			ft.recordTypedefs(t.Type, f.NamePos[names[i]])
 		}
 		if e.Tag != dwarf.TagCompileUnit {
 			r.SkipChildren()
 		}
 	}
+
+	return &debug{names, types, ints, floats, strs}
+}
+
+// debug is the data extracted by running an iteration of loadDWARF on a file.
+type debug struct {
+	names  []*Name
+	types  []dwarf.Type
+	ints   []int64
+	floats []float64
+	strs   []string
+}
+
+func (p *Package) recordTypes(f *File, data *debug, conv *typeConv) {
+	names, types, ints, floats, strs := data.names, data.types, data.ints, data.floats, data.strs
 
 	// Record types and typedef information.
 	for i, n := range names {
@@ -700,12 +728,17 @@ func (p *Package) loadDWARF(f *File, conv *typeConv, names []*Name) {
 	}
 }
 
-// recordTypedefs remembers in p.typedefs all the typedefs used in dtypes and its children.
-func (p *Package) recordTypedefs(dtype dwarf.Type, pos token.Pos) {
-	p.recordTypedefs1(dtype, pos, map[dwarf.Type]bool{})
+type fileTypedefs struct {
+	typedefs    map[string]bool // type names that appear in the types of the objects we're interested in
+	typedefList []typedefInfo
 }
 
-func (p *Package) recordTypedefs1(dtype dwarf.Type, pos token.Pos, visited map[dwarf.Type]bool) {
+// recordTypedefs remembers in ft.typedefs all the typedefs used in dtypes and its children.
+func (ft *fileTypedefs) recordTypedefs(dtype dwarf.Type, pos token.Pos) {
+	ft.recordTypedefs1(dtype, pos, map[dwarf.Type]bool{})
+}
+
+func (ft *fileTypedefs) recordTypedefs1(dtype dwarf.Type, pos token.Pos, visited map[dwarf.Type]bool) {
 	if dtype == nil {
 		return
 	}
@@ -719,25 +752,25 @@ func (p *Package) recordTypedefs1(dtype dwarf.Type, pos token.Pos, visited map[d
 			// Don't look inside builtin types. There be dragons.
 			return
 		}
-		if !p.typedefs[dt.Name] {
-			p.typedefs[dt.Name] = true
-			p.typedefList = append(p.typedefList, typedefInfo{dt.Name, pos})
-			p.recordTypedefs1(dt.Type, pos, visited)
+		if !ft.typedefs[dt.Name] {
+			ft.typedefs[dt.Name] = true
+			ft.typedefList = append(ft.typedefList, typedefInfo{dt.Name, pos})
+			ft.recordTypedefs1(dt.Type, pos, visited)
 		}
 	case *dwarf.PtrType:
-		p.recordTypedefs1(dt.Type, pos, visited)
+		ft.recordTypedefs1(dt.Type, pos, visited)
 	case *dwarf.ArrayType:
-		p.recordTypedefs1(dt.Type, pos, visited)
+		ft.recordTypedefs1(dt.Type, pos, visited)
 	case *dwarf.QualType:
-		p.recordTypedefs1(dt.Type, pos, visited)
+		ft.recordTypedefs1(dt.Type, pos, visited)
 	case *dwarf.FuncType:
-		p.recordTypedefs1(dt.ReturnType, pos, visited)
+		ft.recordTypedefs1(dt.ReturnType, pos, visited)
 		for _, a := range dt.ParamType {
-			p.recordTypedefs1(a, pos, visited)
+			ft.recordTypedefs1(a, pos, visited)
 		}
 	case *dwarf.StructType:
-		for _, f := range dt.Field {
-			p.recordTypedefs1(f.Type, pos, visited)
+		for _, l := range dt.Field {
+			ft.recordTypedefs1(l.Type, pos, visited)
 		}
 	}
 }
@@ -781,16 +814,13 @@ func (p *Package) mangleName(n *Name) {
 }
 
 func (f *File) isMangledName(s string) bool {
-	prefix := "_C"
-	if strings.HasPrefix(s, prefix) {
-		t := s[len(prefix):]
-		for _, k := range nameKinds {
-			if strings.HasPrefix(t, k+"_") {
-				return true
-			}
-		}
+	t, ok := strings.CutPrefix(s, "_C")
+	if !ok {
+		return false
 	}
-	return false
+	return slices.ContainsFunc(nameKinds, func(k string) bool {
+		return strings.HasPrefix(t, k+"_")
+	})
 }
 
 // rewriteCalls rewrites all calls that pass pointers to check that
@@ -924,7 +954,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 			if rtype != name.FuncType.Result.Go {
 				needsUnsafe = true
 			}
-			sb.WriteString(gofmtLine(rtype))
+			sb.WriteString(gofmt(rtype))
 			result = true
 		}
 
@@ -960,7 +990,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 				needsUnsafe = true
 			}
 			fmt.Fprintf(&sb, "var _cgo%d %s = %s; ", i,
-				gofmtLine(ptype), gofmtPos(arg, origArg.Pos()))
+				gofmt(ptype), gofmtPos(arg, origArg.Pos()))
 			continue
 		}
 
@@ -1050,12 +1080,9 @@ func (p *Package) hasPointer(f *File, t ast.Expr, top bool) bool {
 		}
 		return p.hasPointer(f, t.Elt, top)
 	case *ast.StructType:
-		for _, field := range t.Fields.List {
-			if p.hasPointer(f, field.Type, top) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(t.Fields.List, func(field *ast.Field) bool {
+			return p.hasPointer(f, field.Type, top)
+		})
 	case *ast.StarExpr: // Pointer type.
 		if !top {
 			return true
@@ -1601,8 +1628,8 @@ func (p *Package) rewriteName(f *File, r *Ref, addPosition bool) ast.Expr {
 			break
 		}
 		if r.Context == ctxCall2 {
-			if r.Name.Go == "_CMalloc" {
-				error_(r.Pos(), "no two-result form for C.malloc")
+			if builtinDefs[r.Name.Go] != "" {
+				error_(r.Pos(), "no two-result form for C.%s", r.Name.Go)
 				break
 			}
 			// Invent new Name for the two-result function.
@@ -1682,7 +1709,7 @@ func (p *Package) rewriteName(f *File, r *Ref, addPosition bool) ast.Expr {
 // gofmtPos returns the gofmt-formatted string for an AST node,
 // with a comment setting the position before the node.
 func gofmtPos(n ast.Expr, pos token.Pos) string {
-	s := gofmtLine(n)
+	s := gofmt(n)
 	p := fset.Position(pos)
 	if p.Column == 0 {
 		return s
@@ -1724,7 +1751,7 @@ func checkGCCBaseCmd() ([]string, error) {
 }
 
 // gccMachine returns the gcc -m flag to use, either "-m32", "-m64" or "-marm".
-func (p *Package) gccMachine() []string {
+func gccMachine() []string {
 	switch goarch {
 	case "amd64":
 		if goos == "darwin" {
@@ -1761,20 +1788,24 @@ func (p *Package) gccMachine() []string {
 	return nil
 }
 
+var n atomic.Int64
+
 func gccTmp() string {
-	return *objDir + "_cgo_.o"
+	c := strconv.Itoa(int(n.Add(1)))
+	return *objDir + "_cgo_" + c + ".o"
 }
 
 // gccCmd returns the gcc command line to use for compiling
 // the input.
-func (p *Package) gccCmd() []string {
+// gccCommand is called concurrently for different files.
+func (p *Package) gccCmd(ofile string) []string {
 	c := append(gccBaseCmd,
-		"-w",          // no warnings
-		"-Wno-error",  // warnings are not errors
-		"-o"+gccTmp(), // write object to tmp
-		"-gdwarf-2",   // generate DWARF v2 debugging symbols
-		"-c",          // do not link
-		"-xc",         // input language is C
+		"-w",         // no warnings
+		"-Wno-error", // warnings are not errors
+		"-o"+ofile,   // write object to tmp
+		"-gdwarf-2",  // generate DWARF v2 debugging symbols
+		"-c",         // do not link
+		"-xc",        // input language is C
 	)
 	if p.GccIsClang {
 		c = append(c,
@@ -1797,7 +1828,7 @@ func (p *Package) gccCmd() []string {
 	}
 
 	c = append(c, p.GccOptions...)
-	c = append(c, p.gccMachine()...)
+	c = append(c, gccMachine()...)
 	if goos == "aix" {
 		c = append(c, "-maix64")
 		c = append(c, "-mcmodel=large")
@@ -1810,8 +1841,10 @@ func (p *Package) gccCmd() []string {
 
 // gccDebug runs gcc -gdwarf-2 over the C program stdin and
 // returns the corresponding DWARF data and, if present, debug data block.
+// gccDebug is called concurrently with different C programs.
 func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int64, floats []float64, strs []string) {
-	runGcc(stdin, p.gccCmd())
+	ofile := gccTmp()
+	runGcc(stdin, p.gccCmd(ofile))
 
 	isDebugInts := func(s string) bool {
 		// Some systems use leading _ to denote non-assembly symbols.
@@ -1838,8 +1871,8 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		if strings.HasPrefix(s, "___") {
 			s = s[1:]
 		}
-		if strings.HasPrefix(s, "__cgodebug_strlen__") {
-			if n, err := strconv.Atoi(s[len("__cgodebug_strlen__"):]); err == nil {
+		if t, ok := strings.CutPrefix(s, "__cgodebug_strlen__"); ok {
+			if n, err := strconv.Atoi(t); err == nil {
 				return n
 			}
 		}
@@ -1861,11 +1894,11 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		}
 	}
 
-	if f, err := macho.Open(gccTmp()); err == nil {
+	if f, err := macho.Open(ofile); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", ofile, err)
 		}
 		bo := f.ByteOrder
 		if f.Symtab != nil {
@@ -1939,11 +1972,11 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		return d, ints, floats, strs
 	}
 
-	if f, err := elf.Open(gccTmp()); err == nil {
+	if f, err := elf.Open(ofile); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", ofile, err)
 		}
 		bo := f.ByteOrder
 		symtab, err := f.Symbols()
@@ -2039,11 +2072,11 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		return d, ints, floats, strs
 	}
 
-	if f, err := pe.Open(gccTmp()); err == nil {
+	if f, err := pe.Open(ofile); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", ofile, err)
 		}
 		bo := binary.LittleEndian
 		for _, s := range f.Symbols {
@@ -2111,17 +2144,17 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		return d, ints, floats, strs
 	}
 
-	if f, err := xcoff.Open(gccTmp()); err == nil {
+	if f, err := xcoff.Open(ofile); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", ofile, err)
 		}
 		bo := binary.BigEndian
 		for _, s := range f.Symbols {
 			switch {
 			case isDebugInts(s.Name):
-				if i := int(s.SectionNumber) - 1; 0 <= i && i < len(f.Sections) {
+				if i := s.SectionNumber - 1; 0 <= i && i < len(f.Sections) {
 					sect := f.Sections[i]
 					if s.Value < sect.Size {
 						if sdat, err := sect.Data(); err == nil {
@@ -2134,7 +2167,7 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 					}
 				}
 			case isDebugFloats(s.Name):
-				if i := int(s.SectionNumber) - 1; 0 <= i && i < len(f.Sections) {
+				if i := s.SectionNumber - 1; 0 <= i && i < len(f.Sections) {
 					sect := f.Sections[i]
 					if s.Value < sect.Size {
 						if sdat, err := sect.Data(); err == nil {
@@ -2148,7 +2181,7 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 				}
 			default:
 				if n := indexOfDebugStr(s.Name); n != -1 {
-					if i := int(s.SectionNumber) - 1; 0 <= i && i < len(f.Sections) {
+					if i := s.SectionNumber - 1; 0 <= i && i < len(f.Sections) {
 						sect := f.Sections[i]
 						if s.Value < sect.Size {
 							if sdat, err := sect.Data(); err == nil {
@@ -2160,7 +2193,7 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 					break
 				}
 				if n := indexOfDebugStrlen(s.Name); n != -1 {
-					if i := int(s.SectionNumber) - 1; 0 <= i && i < len(f.Sections) {
+					if i := s.SectionNumber - 1; 0 <= i && i < len(f.Sections) {
 						sect := f.Sections[i]
 						if s.Value < sect.Size {
 							if sdat, err := sect.Data(); err == nil {
@@ -2181,7 +2214,7 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		buildStrings()
 		return d, ints, floats, strs
 	}
-	fatalf("cannot parse gcc output %s as ELF, Mach-O, PE, XCOFF object", gccTmp())
+	fatalf("cannot parse gcc output %s as ELF, Mach-O, PE, XCOFF object", ofile)
 	panic("not reached")
 }
 
@@ -2189,19 +2222,20 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 // and returns the corresponding standard output, which is the
 // #defines that gcc encountered while processing the input
 // and its included files.
-func (p *Package) gccDefines(stdin []byte) string {
+func gccDefines(stdin []byte, gccOptions []string) string {
 	base := append(gccBaseCmd, "-E", "-dM", "-xc")
-	base = append(base, p.gccMachine()...)
-	stdout, _ := runGcc(stdin, append(append(base, p.GccOptions...), "-"))
+	base = append(base, gccMachine()...)
+	stdout, _ := runGcc(stdin, append(append(base, gccOptions...), "-"))
 	return stdout
 }
 
 // gccErrors runs gcc over the C program stdin and returns
 // the errors that gcc prints. That is, this function expects
 // gcc to fail.
+// gccErrors is called concurrently with different C programs.
 func (p *Package) gccErrors(stdin []byte, extraArgs ...string) string {
 	// TODO(rsc): require failure
-	args := p.gccCmd()
+	args := p.gccCmd(gccTmp())
 
 	// Optimization options can confuse the error messages; remove them.
 	nargs := make([]string, 0, len(args)+len(extraArgs))
@@ -2579,6 +2613,11 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 		if dt.BitSize > 0 {
 			fatalf("%s: unexpected: %d-bit int type - %s", lineno(pos), dt.BitSize, dtype)
 		}
+
+		if t.Align = t.Size; t.Align >= c.ptrSize {
+			t.Align = c.ptrSize
+		}
+
 		switch t.Size {
 		default:
 			fatalf("%s: unexpected: %d-byte int type - %s", lineno(pos), t.Size, dtype)
@@ -2595,9 +2634,8 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 				Len: c.intExpr(t.Size),
 				Elt: c.uint8,
 			}
-		}
-		if t.Align = t.Size; t.Align >= c.ptrSize {
-			t.Align = c.ptrSize
+			// t.Align is the alignment of the Go type.
+			t.Align = 1
 		}
 
 	case *dwarf.PtrType:
@@ -2826,6 +2864,11 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 		if dt.BitSize > 0 {
 			fatalf("%s: unexpected: %d-bit uint type - %s", lineno(pos), dt.BitSize, dtype)
 		}
+
+		if t.Align = t.Size; t.Align >= c.ptrSize {
+			t.Align = c.ptrSize
+		}
+
 		switch t.Size {
 		default:
 			fatalf("%s: unexpected: %d-byte uint type - %s", lineno(pos), t.Size, dtype)
@@ -2842,9 +2885,8 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 				Len: c.intExpr(t.Size),
 				Elt: c.uint8,
 			}
-		}
-		if t.Align = t.Size; t.Align >= c.ptrSize {
-			t.Align = c.ptrSize
+			// t.Align is the alignment of the Go type.
+			t.Align = 1
 		}
 
 	case *dwarf.VoidType:
@@ -2860,7 +2902,7 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			if ss, ok := dwarfToName[s]; ok {
 				s = ss
 			}
-			s = strings.Replace(s, " ", "", -1)
+			s = strings.ReplaceAll(s, " ", "")
 			name := c.Ident("_Ctype_" + s)
 			tt := *t
 			typedef[name.Name] = &tt
@@ -3110,10 +3152,11 @@ func (c *typeConv) Struct(dt *dwarf.StructType, pos token.Pos) (expr *ast.Struct
 		}
 
 		// Round off up to talign, assumed to be a power of 2.
+		origOff := off
 		off = (off + talign - 1) &^ (talign - 1)
 
 		if f.ByteOffset > off {
-			fld, sizes = c.pad(fld, sizes, f.ByteOffset-off)
+			fld, sizes = c.pad(fld, sizes, f.ByteOffset-origOff)
 			off = f.ByteOffset
 		}
 		if f.ByteOffset < off {
@@ -3193,12 +3236,9 @@ func (c *typeConv) dwarfHasPointer(dt dwarf.Type, pos token.Pos) bool {
 		return c.dwarfHasPointer(dt.Type, pos)
 
 	case *dwarf.StructType:
-		for _, f := range dt.Field {
-			if c.dwarfHasPointer(f.Type, pos) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(dt.Field, func(f *dwarf.StructField) bool {
+			return c.dwarfHasPointer(f.Type, pos)
+		})
 
 	case *dwarf.TypedefType:
 		if dt.Name == "_GoString_" || dt.Name == "_GoBytes_" {

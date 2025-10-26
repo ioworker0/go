@@ -52,7 +52,7 @@ var (
 // the linux-amd64 builder that's already very fast, so we get more
 // test coverage on trybots. See https://go.dev/issue/34297.
 func defaultAllCodeGen() bool {
-	return os.Getenv("GO_BUILDER_NAME") == "linux-amd64"
+	return testenv.Builder() == "gotip-linux-amd64"
 }
 
 var (
@@ -63,15 +63,16 @@ var (
 	cgoEnabled   bool
 	goExperiment string
 	goDebug      string
+	tmpDir       string
 
 	// dirs are the directories to look for *.go files in.
 	// TODO(bradfitz): just use all directories?
-	dirs = []string{".", "ken", "chan", "interface", "syntax", "dwarf", "fixedbugs", "codegen", "runtime", "abi", "typeparam", "typeparam/mdempsky", "arenas"}
+	dirs = []string{".", "ken", "chan", "interface", "internal/runtime/sys", "syntax", "dwarf", "fixedbugs", "codegen", "abi", "typeparam", "typeparam/mdempsky", "arenas"}
 )
 
 // Test is the main entrypoint that runs tests in the GOROOT/test directory.
 //
-// Each .go file test case in GOROOT/test is registered as a subtest with a
+// Each .go file test case in GOROOT/test is registered as a subtest with
 // a full name like "Test/fixedbugs/bug000.go" ('/'-separated relative path).
 func Test(t *testing.T) {
 	if *target != "" {
@@ -115,6 +116,7 @@ func Test(t *testing.T) {
 	cgoEnabled, _ = strconv.ParseBool(env.CGO_ENABLED)
 	goExperiment = env.GOEXPERIMENT
 	goDebug = env.GODEBUG
+	tmpDir = t.TempDir()
 
 	common := testCommon{
 		gorootTestDir: filepath.Join(testenv.GOROOT(t), "test"),
@@ -162,22 +164,17 @@ func shardMatch(name string) bool {
 }
 
 func goFiles(t *testing.T, dir string) []string {
-	f, err := os.Open(filepath.Join(testenv.GOROOT(t), "test", dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	dirnames, err := f.Readdirnames(-1)
-	f.Close()
+	files, err := os.ReadDir(filepath.Join(testenv.GOROOT(t), "test", dir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	names := []string{}
-	for _, name := range dirnames {
+	for _, file := range files {
+		name := file.Name()
 		if !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go") && shardMatch(name) {
 			names = append(names, name)
 		}
 	}
-	sort.Strings(names)
 	return names
 }
 
@@ -214,52 +211,45 @@ func compileInDir(runcmd runCmd, dir string, flags []string, importcfg string, p
 	return runcmd(cmd...)
 }
 
-var stdlibImportcfgStringOnce sync.Once // TODO(#56102): Use sync.OnceValue once available. Also below.
-var stdlibImportcfgString string
+var stdlibImportcfg = sync.OnceValue(func() string {
+	cmd := exec.Command(goTool, "list", "-export", "-f", "{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}", "std")
+	cmd.Env = append(os.Environ(), "GOENV=off", "GOFLAGS=")
+	output, err := cmd.Output()
+	if err, ok := err.(*exec.ExitError); ok && len(err.Stderr) != 0 {
+		log.Fatalf("'go list' failed: %v: %s", err, err.Stderr)
+	}
+	if err != nil {
+		log.Fatalf("'go list' failed: %v", err)
+	}
+	return string(output)
+})
 
-func stdlibImportcfg() string {
-	stdlibImportcfgStringOnce.Do(func() {
-		output, err := exec.Command(goTool, "list", "-export", "-f", "{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}", "std").Output()
-		if err != nil {
-			log.Fatal(err)
-		}
-		stdlibImportcfgString = string(output)
-	})
-	return stdlibImportcfgString
-}
+var stdlibImportcfgFile = sync.OnceValue(func() string {
+	filename := filepath.Join(tmpDir, "importcfg")
+	err := os.WriteFile(filename, []byte(stdlibImportcfg()), 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return filename
+})
 
-var stdlibImportcfgFilenameOnce sync.Once
-var stdlibImportcfgFilename string
-
-func stdlibImportcfgFile() string {
-	stdlibImportcfgFilenameOnce.Do(func() {
-		tmpdir, err := os.MkdirTemp("", "importcfg")
-		if err != nil {
-			log.Fatal(err)
-		}
-		filename := filepath.Join(tmpdir, "importcfg")
-		err = os.WriteFile(filename, []byte(stdlibImportcfg()), 0644)
-		if err != nil {
-			log.Fatal(err)
-		}
-		stdlibImportcfgFilename = filename
-	})
-	return stdlibImportcfgFilename
-}
-
-func linkFile(runcmd runCmd, goname string, importcfg string, ldflags []string) (err error) {
+// linkFile links infile with the given importcfg and ldflags, writes to outfile.
+// infile can be the name of an object file or a go source file.
+func linkFile(runcmd runCmd, outfile, infile string, importcfg string, ldflags []string) (err error) {
 	if importcfg == "" {
 		importcfg = stdlibImportcfgFile()
 	}
-	pfile := strings.Replace(goname, ".go", ".o", -1)
-	cmd := []string{goTool, "tool", "link", "-w", "-o", "a.exe", "-importcfg=" + importcfg}
+	if strings.HasSuffix(infile, ".go") {
+		infile = infile[:len(infile)-3] + ".o"
+	}
+	cmd := []string{goTool, "tool", "link", "-s", "-w", "-buildid=test", "-o", outfile, "-importcfg=" + importcfg}
 	if *linkshared {
 		cmd = append(cmd, "-linkshared", "-installsuffix=dynlink")
 	}
 	if ldflags != nil {
 		cmd = append(cmd, ldflags...)
 	}
-	cmd = append(cmd, pfile)
+	cmd = append(cmd, infile)
 	_, err = runcmd(cmd...)
 	return
 }
@@ -309,7 +299,7 @@ func (t test) goFileName() string {
 }
 
 func (t test) goDirName() string {
-	return filepath.Join(t.dir, strings.Replace(t.goFile, ".go", ".dir", -1))
+	return filepath.Join(t.dir, strings.ReplaceAll(t.goFile, ".go", ".dir"))
 }
 
 // goDirFiles returns .go files in dir.
@@ -541,6 +531,7 @@ func (t test) run() error {
 
 	goexp := goExperiment
 	godebug := goDebug
+	gomodvers := ""
 
 	// collect flags
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
@@ -580,6 +571,10 @@ func (t test) run() error {
 			}
 			godebug += args[0]
 			runenv = append(runenv, "GODEBUG="+godebug)
+
+		case "-gomodversion": // set the GoVersion in generated go.mod files (just runindir ATM)
+			args = args[1:]
+			gomodvers = args[0]
 
 		default:
 			flags = append(flags, args[0])
@@ -862,7 +857,7 @@ func (t test) run() error {
 			}
 
 			if i == len(pkgs)-1 {
-				err = linkFile(runcmd, pkg.files[0], importcfgfile, ldflags)
+				err = linkFile(runcmd, "a.exe", pkg.files[0], importcfgfile, ldflags)
 				if err != nil {
 					return err
 				}
@@ -898,7 +893,11 @@ func (t test) run() error {
 			t.Fatal(err)
 		}
 
-		modFile := fmt.Sprintf("module %s\ngo 1.14\n", modName)
+		modVersion := gomodvers
+		if modVersion == "" {
+			modVersion = "1.14"
+		}
+		modFile := fmt.Sprintf("module %s\ngo %s\n", modName, modVersion)
 		if err := os.WriteFile(filepath.Join(gopathSrcDir, "go.mod"), []byte(modFile), 0666); err != nil {
 			t.Fatal(err)
 		}
@@ -940,7 +939,6 @@ func (t test) run() error {
 			case ".s":
 				asms = append(asms, filepath.Join(longdir, file.Name()))
 			}
-
 		}
 		if len(asms) > 0 {
 			emptyHdrFile := filepath.Join(tempDir, "go_asm.h")
@@ -980,8 +978,7 @@ func (t test) run() error {
 		if err != nil {
 			return err
 		}
-		cmd = []string{goTool, "tool", "link", "-importcfg=" + stdlibImportcfgFile(), "-o", "a.exe", "all.a"}
-		_, err = runcmd(cmd...)
+		err = linkFile(runcmd, "a.exe", "all.a", stdlibImportcfgFile(), nil)
 		if err != nil {
 			return err
 		}
@@ -1039,9 +1036,7 @@ func (t test) run() error {
 				return err
 			}
 			exe := filepath.Join(tempDir, "test.exe")
-			cmd := []string{goTool, "tool", "link", "-s", "-w", "-importcfg=" + stdlibImportcfgFile()}
-			cmd = append(cmd, "-o", exe, pkg)
-			if _, err := runcmd(cmd...); err != nil {
+			if err := linkFile(runcmd, exe, pkg, stdlibImportcfgFile(), nil); err != nil {
 				return err
 			}
 			out, err = runcmd(append([]string{exe}, args...)...)
@@ -1126,19 +1121,15 @@ func (t test) run() error {
 	}
 }
 
-var execCmdOnce sync.Once
-var execCmd []string
-
-func findExecCmd() []string {
-	execCmdOnce.Do(func() {
-		if goos == runtime.GOOS && goarch == runtime.GOARCH {
-			// Do nothing.
-		} else if path, err := exec.LookPath(fmt.Sprintf("go_%s_%s_exec", goos, goarch)); err == nil {
-			execCmd = []string{path}
-		}
-	})
+var findExecCmd = sync.OnceValue(func() (execCmd []string) {
+	if goos == runtime.GOOS && goarch == runtime.GOARCH {
+		return nil
+	}
+	if path, err := exec.LookPath(fmt.Sprintf("go_%s_%s_exec", goos, goarch)); err == nil {
+		execCmd = []string{path}
+	}
 	return execCmd
-}
+})
 
 // checkExpectedOutput compares the output from compiling and/or running with the contents
 // of the corresponding reference output file, if any (replace ".go" with ".out").
@@ -1155,7 +1146,7 @@ func (t test) checkExpectedOutput(gotBytes []byte) error {
 	} else if err != nil {
 		return err
 	}
-	got = strings.Replace(got, "\r\n", "\n", -1)
+	got = strings.ReplaceAll(got, "\r\n", "\n")
 	if got != string(b) {
 		if err == nil {
 			return fmt.Errorf("output does not match expected in %s. Instead saw\n%s", filename, got)
@@ -1210,7 +1201,7 @@ func (t test) errorCheck(outStr string, wantAuto bool, fullshort ...string) (err
 	for i := range out {
 		for j := 0; j < len(fullshort); j += 2 {
 			full, short := fullshort[j], fullshort[j+1]
-			out[i] = strings.Replace(out[i], full, short, -1)
+			out[i] = replacePrefix(out[i], full, short)
 		}
 	}
 
@@ -1253,6 +1244,24 @@ func (t test) errorCheck(outStr string, wantAuto bool, fullshort ...string) (err
 	}
 
 	if len(out) > 0 {
+		// If a test uses -m and instantiates an imported generic function,
+		// the errors will include messages for the instantiated function
+		// with locations in the other package. Filter those out.
+		localOut := make([]string, 0, len(out))
+	outLoop:
+		for _, errLine := range out {
+			for j := 0; j < len(fullshort); j += 2 {
+				full, short := fullshort[j], fullshort[j+1]
+				if strings.HasPrefix(errLine, full+":") || strings.HasPrefix(errLine, short+":") {
+					localOut = append(localOut, errLine)
+					continue outLoop
+				}
+			}
+		}
+		out = localOut
+	}
+
+	if len(out) > 0 {
 		errs = append(errs, fmt.Errorf("Unmatched Errors:"))
 		for _, errLine := range out {
 			errs = append(errs, fmt.Errorf("%s", errLine))
@@ -1289,9 +1298,16 @@ func (test) updateErrors(out, file string) {
 	// Parse new errors.
 	errors := make(map[int]map[string]bool)
 	tmpRe := regexp.MustCompile(`autotmp_\d+`)
+	fileRe := regexp.MustCompile(`(\.go):\d+:`)
 	for _, errStr := range splitOutput(out, false) {
-		errFile, rest, ok := strings.Cut(errStr, ":")
-		if !ok || errFile != file {
+		m := fileRe.FindStringSubmatchIndex(errStr)
+		if len(m) != 4 {
+			continue
+		}
+		// The end of the file is the end of the first and only submatch.
+		errFile := errStr[:m[3]]
+		rest := errStr[m[3]+1:]
+		if errFile != file {
 			continue
 		}
 		lineStr, msg, ok := strings.Cut(rest, ":")
@@ -1303,12 +1319,12 @@ func (test) updateErrors(out, file string) {
 		if err != nil || line < 0 || line >= len(lines) {
 			continue
 		}
-		msg = strings.Replace(msg, file, base, -1) // normalize file mentions in error itself
+		msg = strings.ReplaceAll(msg, file, base) // normalize file mentions in error itself
 		msg = strings.TrimLeft(msg, " \t")
 		for _, r := range []string{`\`, `*`, `+`, `?`, `[`, `]`, `(`, `)`} {
-			msg = strings.Replace(msg, r, `\`+r, -1)
+			msg = strings.ReplaceAll(msg, r, `\`+r)
 		}
-		msg = strings.Replace(msg, `"`, `.`, -1)
+		msg = strings.ReplaceAll(msg, `"`, `.`)
 		msg = tmpRe.ReplaceAllLiteralString(msg, `autotmp_[0-9]+`)
 		if errors[line] == nil {
 			errors[line] = make(map[string]bool)
@@ -1447,9 +1463,10 @@ func (t test) wantedErrors(file, short string) (errs []wantedError) {
 
 const (
 	// Regexp to match a single opcode check: optionally begin with "-" (to indicate
-	// a negative check), followed by a string literal enclosed in "" or ``. For "",
+	// a negative check) or a positive number (to specify the expected number of
+	// matches), followed by a string literal enclosed in "" or ``. For "",
 	// backslashes must be handled.
-	reMatchCheck = `-?(?:\x60[^\x60]*\x60|"(?:[^"\\]|\\.)*")`
+	reMatchCheck = `(-|[1-9]\d*)?(?:\x60[^\x60]*\x60|"(?:[^"\\]|\\.)*")`
 )
 
 var (
@@ -1459,7 +1476,19 @@ var (
 	// Regexp to extract an architecture check: architecture name (or triplet),
 	// followed by semi-colon, followed by a comma-separated list of opcode checks.
 	// Extraneous spaces are ignored.
-	rxAsmPlatform = regexp.MustCompile(`(\w+)(/\w+)?(/\w*)?\s*:\s*(` + reMatchCheck + `(?:\s*,\s*` + reMatchCheck + `)*)`)
+	//
+	// An example: arm64/v8.1 : -`ADD` , `SUB`
+	//	"(\w+)" matches "arm64" (architecture name)
+	//	"(/[\w.]+)?" matches "v8.1" (architecture version)
+	//	"(/\w*)?" doesn't match anything here (it's an optional part of the triplet)
+	//	"\s*:\s*" matches " : " (semi-colon)
+	//	"(" starts a capturing group
+	//      first reMatchCheck matches "-`ADD`"
+	//	`(?:" starts a non-capturing group
+	//	"\s*,\s*` matches " , "
+	//	second reMatchCheck matches "`SUB`"
+	//	")*)" closes started groups; "*" means that there might be other elements in the comma-separated list
+	rxAsmPlatform = regexp.MustCompile(`(\w+)(/[\w.]+)?(/\w*)?\s*:\s*(` + reMatchCheck + `(?:\s*,\s*` + reMatchCheck + `)*)`)
 
 	// Regexp to extract a single opcoded check
 	rxAsmCheck = regexp.MustCompile(reMatchCheck)
@@ -1471,7 +1500,7 @@ var (
 		"386":     {"GO386", "sse2", "softfloat"},
 		"amd64":   {"GOAMD64", "v1", "v2", "v3", "v4"},
 		"arm":     {"GOARM", "5", "6", "7", "7,softfloat"},
-		"arm64":   {},
+		"arm64":   {"GOARM64", "v8.0", "v8.1"},
 		"loong64": {},
 		"mips":    {"GOMIPS", "hardfloat", "softfloat"},
 		"mips64":  {"GOMIPS64", "hardfloat", "softfloat"},
@@ -1480,7 +1509,7 @@ var (
 		"ppc64x":  {}, // A pseudo-arch representing both ppc64 and ppc64le
 		"s390x":   {},
 		"wasm":    {},
-		"riscv64": {"GORISCV64", "rva20u64", "rva22u64"},
+		"riscv64": {"GORISCV64", "rva20u64", "rva22u64", "rva23u64"},
 	}
 )
 
@@ -1489,6 +1518,8 @@ type wantedAsmOpcode struct {
 	fileline string         // original source file/line (eg: "/path/foo.go:45")
 	line     int            // original source line
 	opcode   *regexp.Regexp // opcode check to be performed on assembly output
+	expected int            // expected number of matches
+	actual   int            // actual number that matched
 	negative bool           // true if the check is supposed to fail rather than pass
 	found    bool           // true if the opcode check matched at least one in the output
 }
@@ -1595,9 +1626,16 @@ func (t test) wantedAsmOpcodes(fn string) asmChecks {
 
 			for _, m := range rxAsmCheck.FindAllString(allchecks, -1) {
 				negative := false
+				expected := 0
 				if m[0] == '-' {
 					negative = true
 					m = m[1:]
+				} else if '1' <= m[0] && m[0] <= '9' {
+					for '0' <= m[0] && m[0] <= '9' {
+						expected *= 10
+						expected += int(m[0] - '0')
+						m = m[1:]
+					}
 				}
 
 				rxsrc, err := strconv.Unquote(m)
@@ -1623,6 +1661,7 @@ func (t test) wantedAsmOpcodes(fn string) asmChecks {
 						ops[env] = make(map[string][]wantedAsmOpcode)
 					}
 					ops[env][lnum] = append(ops[env][lnum], wantedAsmOpcode{
+						expected: expected,
 						negative: negative,
 						fileline: lnum,
 						line:     i + 1,
@@ -1671,7 +1710,8 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 		// run the checks.
 		if ops, found := fullops[srcFileLine]; found {
 			for i := range ops {
-				if !ops[i].found && ops[i].opcode.FindString(asm) != "" {
+				if (!ops[i].found || ops[i].expected > 0) && ops[i].opcode.FindString(asm) != "" {
+					ops[i].actual++
 					ops[i].found = true
 				}
 			}
@@ -1685,6 +1725,9 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 			// There's a failure if a negative match was found,
 			// or a positive match was not found.
 			if o.negative == o.found {
+				failed = append(failed, o)
+			}
+			if o.expected > 0 && o.expected != o.actual {
 				failed = append(failed, o)
 			}
 		}
@@ -1710,6 +1753,8 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 
 		if o.negative {
 			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong opcode found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
+		} else if o.expected > 0 {
+			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong number of opcodes: %q\n", t.goFileName(), o.line, env, o.opcode.String())
 		} else {
 			fmt.Fprintf(&errbuf, "%s:%d: %s: opcode not found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
 		}
@@ -1847,7 +1892,6 @@ var types2Failures = setOf(
 	"fixedbugs/issue20233.go", // types2 reports two instead of one error (preference: 1.17 compiler)
 	"fixedbugs/issue20245.go", // types2 reports two instead of one error (preference: 1.17 compiler)
 	"fixedbugs/issue31053.go", // types2 reports "unknown field" instead of "cannot refer to unexported field"
-	"fixedbugs/notinheap.go",  // types2 doesn't report errors about conversions that are invalid due to //go:notinheap
 )
 
 var types2Failures32Bit = setOf(
@@ -1948,4 +1992,24 @@ func splitQuoted(s string) (r []string, err error) {
 		err = errors.New("unfinished escaping")
 	}
 	return args, err
+}
+
+// replacePrefix is like strings.ReplaceAll, but only replaces instances of old
+// that are preceded by ' ', '\t', or appear at the beginning of a line.
+//
+// This does the same kind of filename string replacement as cmd/go.
+// Pilfered from src/cmd/go/internal/work/shell.go .
+func replacePrefix(s, old, new string) string {
+	n := strings.Count(s, old)
+	if n == 0 {
+		return s
+	}
+
+	s = strings.ReplaceAll(s, " "+old, " "+new)
+	s = strings.ReplaceAll(s, "\n"+old, "\n"+new)
+	s = strings.ReplaceAll(s, "\n\t"+old, "\n\t"+new)
+	if strings.HasPrefix(s, old) {
+		s = new + s[len(old):]
+	}
+	return s
 }

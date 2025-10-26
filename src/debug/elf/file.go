@@ -25,6 +25,7 @@ import (
 	"internal/saferio"
 	"internal/zstd"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"unsafe"
@@ -52,11 +53,12 @@ type FileHeader struct {
 // A File represents an open ELF file.
 type File struct {
 	FileHeader
-	Sections  []*Section
-	Progs     []*Prog
-	closer    io.Closer
-	gnuNeed   []verneed
-	gnuVersym []byte
+	Sections    []*Section
+	Progs       []*Prog
+	closer      io.Closer
+	dynVers     []DynamicVersion
+	dynVerNeeds []DynamicVersionNeed
+	gnuVersym   []byte
 }
 
 // A SectionHeader represents a single ELF section header.
@@ -207,11 +209,19 @@ func (p *Prog) Open() io.ReadSeeker { return io.NewSectionReader(p.sr, 0, 1<<63-
 type Symbol struct {
 	Name        string
 	Info, Other byte
+
+	// HasVersion reports whether the symbol has any version information.
+	// This will only be true for the dynamic symbol table.
+	HasVersion bool
+	// VersionIndex is the symbol's version index.
+	// Use the methods of the [VersionIndex] type to access it.
+	// This field is only meaningful if HasVersion is true.
+	VersionIndex VersionIndex
+
 	Section     SectionIndex
 	Value, Size uint64
 
-	// Version and Library are present only for the dynamic symbol
-	// table.
+	// These fields are present only for the dynamic symbol table.
 	Version string
 	Library string
 }
@@ -491,6 +501,9 @@ func NewFile(r io.ReaderAt) (*File, error) {
 	if c < 0 {
 		return nil, &FormatError{0, "too many sections", shnum}
 	}
+	if shnum > 0 && ((1<<64)-1)/uint64(shnum) < uint64(shentsize) {
+		return nil, &FormatError{0, "section header overflow", shnum}
+	}
 	f.Sections = make([]*Section, 0, c)
 	names := make([]uint32, 0, c)
 	shdata, err := saferio.ReadDataAt(sr, uint64(shnum)*uint64(shentsize), shoff)
@@ -680,6 +693,9 @@ func (f *File) getSymbols64(typ SectionType) ([]Symbol, []byte, error) {
 	if len(data)%Sym64Size != 0 {
 		return nil, nil, errors.New("length of symbol section is not a multiple of Sym64Size")
 	}
+	if len(data) == 0 {
+		return nil, nil, ErrNoSymbols
+	}
 
 	strdata, err := f.stringTable(symtabSection.Link)
 	if err != nil {
@@ -815,17 +831,9 @@ func (f *File) applyRelocationsAMD64(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_X86_64_64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
 		case R_X86_64_32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -857,12 +865,7 @@ func (f *File) applyRelocations386(dst []byte, rels []byte) error {
 		sym := &symbols[symNo-1]
 
 		if t == R_386_32 {
-			if rel.Off+4 >= uint32(len(dst)) {
-				continue
-			}
-			val := f.ByteOrder.Uint32(dst[rel.Off : rel.Off+4])
-			val += uint32(sym.Value)
-			f.ByteOrder.PutUint32(dst[rel.Off:rel.Off+4], val)
+			putUint(f.ByteOrder, dst, uint64(rel.Off), 4, sym.Value, 0, true)
 		}
 	}
 
@@ -895,12 +898,7 @@ func (f *File) applyRelocationsARM(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_ARM_ABS32:
-			if rel.Off+4 >= uint32(len(dst)) {
-				continue
-			}
-			val := f.ByteOrder.Uint32(dst[rel.Off : rel.Off+4])
-			val += uint32(sym.Value)
-			f.ByteOrder.PutUint32(dst[rel.Off:rel.Off+4], val)
+			putUint(f.ByteOrder, dst, uint64(rel.Off), 4, sym.Value, 0, true)
 		}
 	}
 
@@ -940,17 +938,9 @@ func (f *File) applyRelocationsARM64(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_AARCH64_ABS64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
 		case R_AARCH64_ABS32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -986,11 +976,7 @@ func (f *File) applyRelocationsPPC(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_PPC_ADDR32:
-			if rela.Off+4 >= uint32(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, uint64(rela.Off), 4, sym.Value, 0, false)
 		}
 	}
 
@@ -1026,17 +1012,9 @@ func (f *File) applyRelocationsPPC64(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_PPC64_ADDR64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
 		case R_PPC64_ADDR32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -1069,12 +1047,7 @@ func (f *File) applyRelocationsMIPS(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_MIPS_32:
-			if rel.Off+4 >= uint32(len(dst)) {
-				continue
-			}
-			val := f.ByteOrder.Uint32(dst[rel.Off : rel.Off+4])
-			val += uint32(sym.Value)
-			f.ByteOrder.PutUint32(dst[rel.Off:rel.Off+4], val)
+			putUint(f.ByteOrder, dst, uint64(rel.Off), 4, sym.Value, 0, true)
 		}
 	}
 
@@ -1117,17 +1090,9 @@ func (f *File) applyRelocationsMIPS64(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_MIPS_64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
 		case R_MIPS_32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -1165,17 +1130,9 @@ func (f *File) applyRelocationsLOONG64(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_LARCH_64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
 		case R_LARCH_32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -1211,17 +1168,9 @@ func (f *File) applyRelocationsRISCV64(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_RISCV_64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
 		case R_RISCV_32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -1257,17 +1206,9 @@ func (f *File) applyRelocationss390x(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_390_64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
 		case R_390_32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -1303,17 +1244,10 @@ func (f *File) applyRelocationsSPARC64(dst []byte, rels []byte) error {
 
 		switch t {
 		case R_SPARC_64, R_SPARC_UA64:
-			if rela.Off+8 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val64 := sym.Value + uint64(rela.Addend)
-			f.ByteOrder.PutUint64(dst[rela.Off:rela.Off+8], val64)
+			putUint(f.ByteOrder, dst, rela.Off, 8, sym.Value, rela.Addend, false)
+
 		case R_SPARC_32, R_SPARC_UA32:
-			if rela.Off+4 >= uint64(len(dst)) || rela.Addend < 0 {
-				continue
-			}
-			val32 := uint32(sym.Value) + uint32(rela.Addend)
-			f.ByteOrder.PutUint32(dst[rela.Off:rela.Off+4], val32)
+			putUint(f.ByteOrder, dst, rela.Off, 4, sym.Value, rela.Addend, false)
 		}
 	}
 
@@ -1434,7 +1368,7 @@ func (f *File) Symbols() ([]Symbol, error) {
 // will be listed in the order they appear in f.
 //
 // If f has a symbol version table, the returned [File.Symbols] will have
-// initialized [Version] and Library fields.
+// initialized Version and Library fields.
 //
 // For compatibility with [File.Symbols], [File.DynamicSymbols] omits the null symbol at index 0.
 // After retrieving the symbols as symtab, an externally supplied index x
@@ -1444,9 +1378,13 @@ func (f *File) DynamicSymbols() ([]Symbol, error) {
 	if err != nil {
 		return nil, err
 	}
-	if f.gnuVersionInit(str) {
+	hasVersions, err := f.gnuVersionInit(str)
+	if err != nil {
+		return nil, err
+	}
+	if hasVersions {
 		for i := range sym {
-			sym[i].Library, sym[i].Version = f.gnuVersion(i)
+			sym[i].HasVersion, sym[i].VersionIndex, sym[i].Version, sym[i].Library = f.gnuVersion(i)
 		}
 	}
 	return sym, nil
@@ -1467,79 +1405,135 @@ func (f *File) ImportedSymbols() ([]ImportedSymbol, error) {
 	if err != nil {
 		return nil, err
 	}
-	f.gnuVersionInit(str)
+	if _, err := f.gnuVersionInit(str); err != nil {
+		return nil, err
+	}
 	var all []ImportedSymbol
 	for i, s := range sym {
 		if ST_BIND(s.Info) == STB_GLOBAL && s.Section == SHN_UNDEF {
 			all = append(all, ImportedSymbol{Name: s.Name})
 			sym := &all[len(all)-1]
-			sym.Library, sym.Version = f.gnuVersion(i)
+			_, _, sym.Version, sym.Library = f.gnuVersion(i)
 		}
 	}
 	return all, nil
 }
 
-type verneed struct {
-	File string
-	Name string
+// VersionIndex is the type of a [Symbol] version index.
+type VersionIndex uint16
+
+// IsHidden reports whether the symbol is hidden within the version.
+// This means that the symbol can only be seen by specifying the exact version.
+func (vi VersionIndex) IsHidden() bool {
+	return vi&0x8000 != 0
 }
 
-// gnuVersionInit parses the GNU version tables
-// for use by calls to gnuVersion.
-func (f *File) gnuVersionInit(str []byte) bool {
-	if f.gnuNeed != nil {
-		// Already initialized
-		return true
+// Index returns the version index.
+// If this is the value 0, it means that the symbol is local,
+// and is not visible externally.
+// If this is the value 1, it means that the symbol is in the base version,
+// and has no specific version; it may or may not match a
+// [DynamicVersion.Index] in the slice returned by [File.DynamicVersions].
+// Other values will match either [DynamicVersion.Index]
+// in the slice returned by [File.DynamicVersions],
+// or [DynamicVersionDep.Index] in the Needs field
+// of the elements of the slice returned by [File.DynamicVersionNeeds].
+// In general, a defined symbol will have an index referring
+// to DynamicVersions, and an undefined symbol will have an index
+// referring to some version in DynamicVersionNeeds.
+func (vi VersionIndex) Index() uint16 {
+	return uint16(vi & 0x7fff)
+}
+
+// DynamicVersion is a version defined by a dynamic object.
+// This describes entries in the ELF SHT_GNU_verdef section.
+// We assume that the vd_version field is 1.
+// Note that the name of the version appears here;
+// it is not in the first Deps entry as it is in the ELF file.
+type DynamicVersion struct {
+	Name  string // Name of version defined by this index.
+	Index uint16 // Version index.
+	Flags DynamicVersionFlag
+	Deps  []string // Names of versions that this version depends upon.
+}
+
+// DynamicVersionNeed describes a shared library needed by a dynamic object,
+// with a list of the versions needed from that shared library.
+// This describes entries in the ELF SHT_GNU_verneed section.
+// We assume that the vn_version field is 1.
+type DynamicVersionNeed struct {
+	Name  string              // Shared library name.
+	Needs []DynamicVersionDep // Dependencies.
+}
+
+// DynamicVersionDep is a version needed from some shared library.
+type DynamicVersionDep struct {
+	Flags DynamicVersionFlag
+	Index uint16 // Version index.
+	Dep   string // Name of required version.
+}
+
+// dynamicVersions returns version information for a dynamic object.
+func (f *File) dynamicVersions(str []byte) error {
+	if f.dynVers != nil {
+		// Already initialized.
+		return nil
 	}
 
-	// Accumulate verneed information.
-	vn := f.SectionByType(SHT_GNU_VERNEED)
-	if vn == nil {
-		return false
+	// Accumulate verdef information.
+	vd := f.SectionByType(SHT_GNU_VERDEF)
+	if vd == nil {
+		return nil
 	}
-	d, _ := vn.Data()
+	d, _ := vd.Data()
 
-	var need []verneed
+	var dynVers []DynamicVersion
 	i := 0
 	for {
-		if i+16 > len(d) {
+		if i+20 > len(d) {
 			break
 		}
-		vers := f.ByteOrder.Uint16(d[i : i+2])
-		if vers != 1 {
-			break
+		version := f.ByteOrder.Uint16(d[i : i+2])
+		if version != 1 {
+			return &FormatError{int64(vd.Offset + uint64(i)), "unexpected dynamic version", version}
 		}
-		cnt := f.ByteOrder.Uint16(d[i+2 : i+4])
-		fileoff := f.ByteOrder.Uint32(d[i+4 : i+8])
-		aux := f.ByteOrder.Uint32(d[i+8 : i+12])
-		next := f.ByteOrder.Uint32(d[i+12 : i+16])
-		file, _ := getString(str, int(fileoff))
+		flags := DynamicVersionFlag(f.ByteOrder.Uint16(d[i+2 : i+4]))
+		ndx := f.ByteOrder.Uint16(d[i+4 : i+6])
+		cnt := f.ByteOrder.Uint16(d[i+6 : i+8])
+		aux := f.ByteOrder.Uint32(d[i+12 : i+16])
+		next := f.ByteOrder.Uint32(d[i+16 : i+20])
+
+		if cnt == 0 {
+			return &FormatError{int64(vd.Offset + uint64(i)), "dynamic version has no name", nil}
+		}
 
 		var name string
+		var depName string
+		var deps []string
 		j := i + int(aux)
 		for c := 0; c < int(cnt); c++ {
-			if j+16 > len(d) {
+			if j+8 > len(d) {
 				break
 			}
-			// hash := f.ByteOrder.Uint32(d[j:j+4])
-			// flags := f.ByteOrder.Uint16(d[j+4:j+6])
-			other := f.ByteOrder.Uint16(d[j+6 : j+8])
-			nameoff := f.ByteOrder.Uint32(d[j+8 : j+12])
-			next := f.ByteOrder.Uint32(d[j+12 : j+16])
-			name, _ = getString(str, int(nameoff))
-			ndx := int(other)
-			if ndx >= len(need) {
-				a := make([]verneed, 2*(ndx+1))
-				copy(a, need)
-				need = a
+			vname := f.ByteOrder.Uint32(d[j : j+4])
+			vnext := f.ByteOrder.Uint32(d[j+4 : j+8])
+			depName, _ = getString(str, int(vname))
+
+			if c == 0 {
+				name = depName
+			} else {
+				deps = append(deps, depName)
 			}
 
-			need[ndx] = verneed{file, name}
-			if next == 0 {
-				break
-			}
-			j += int(next)
+			j += int(vnext)
 		}
+
+		dynVers = append(dynVers, DynamicVersion{
+			Name:  name,
+			Index: ndx,
+			Flags: flags,
+			Deps:  deps,
+		})
 
 		if next == 0 {
 			break
@@ -1547,36 +1541,174 @@ func (f *File) gnuVersionInit(str []byte) bool {
 		i += int(next)
 	}
 
+	f.dynVers = dynVers
+
+	return nil
+}
+
+// DynamicVersions returns version information for a dynamic object.
+func (f *File) DynamicVersions() ([]DynamicVersion, error) {
+	if f.dynVers == nil {
+		_, str, err := f.getSymbols(SHT_DYNSYM)
+		if err != nil {
+			return nil, err
+		}
+		hasVersions, err := f.gnuVersionInit(str)
+		if err != nil {
+			return nil, err
+		}
+		if !hasVersions {
+			return nil, errors.New("DynamicVersions: missing version table")
+		}
+	}
+
+	return f.dynVers, nil
+}
+
+// dynamicVersionNeeds returns version dependencies for a dynamic object.
+func (f *File) dynamicVersionNeeds(str []byte) error {
+	if f.dynVerNeeds != nil {
+		// Already initialized.
+		return nil
+	}
+
+	// Accumulate verneed information.
+	vn := f.SectionByType(SHT_GNU_VERNEED)
+	if vn == nil {
+		return nil
+	}
+	d, _ := vn.Data()
+
+	var dynVerNeeds []DynamicVersionNeed
+	i := 0
+	for {
+		if i+16 > len(d) {
+			break
+		}
+		vers := f.ByteOrder.Uint16(d[i : i+2])
+		if vers != 1 {
+			return &FormatError{int64(vn.Offset + uint64(i)), "unexpected dynamic need version", vers}
+		}
+		cnt := f.ByteOrder.Uint16(d[i+2 : i+4])
+		fileoff := f.ByteOrder.Uint32(d[i+4 : i+8])
+		aux := f.ByteOrder.Uint32(d[i+8 : i+12])
+		next := f.ByteOrder.Uint32(d[i+12 : i+16])
+		file, _ := getString(str, int(fileoff))
+
+		var deps []DynamicVersionDep
+		j := i + int(aux)
+		for c := 0; c < int(cnt); c++ {
+			if j+16 > len(d) {
+				break
+			}
+			flags := DynamicVersionFlag(f.ByteOrder.Uint16(d[j+4 : j+6]))
+			index := f.ByteOrder.Uint16(d[j+6 : j+8])
+			nameoff := f.ByteOrder.Uint32(d[j+8 : j+12])
+			next := f.ByteOrder.Uint32(d[j+12 : j+16])
+			depName, _ := getString(str, int(nameoff))
+
+			deps = append(deps, DynamicVersionDep{
+				Flags: flags,
+				Index: index,
+				Dep:   depName,
+			})
+
+			if next == 0 {
+				break
+			}
+			j += int(next)
+		}
+
+		dynVerNeeds = append(dynVerNeeds, DynamicVersionNeed{
+			Name:  file,
+			Needs: deps,
+		})
+
+		if next == 0 {
+			break
+		}
+		i += int(next)
+	}
+
+	f.dynVerNeeds = dynVerNeeds
+
+	return nil
+}
+
+// DynamicVersionNeeds returns version dependencies for a dynamic object.
+func (f *File) DynamicVersionNeeds() ([]DynamicVersionNeed, error) {
+	if f.dynVerNeeds == nil {
+		_, str, err := f.getSymbols(SHT_DYNSYM)
+		if err != nil {
+			return nil, err
+		}
+		hasVersions, err := f.gnuVersionInit(str)
+		if err != nil {
+			return nil, err
+		}
+		if !hasVersions {
+			return nil, errors.New("DynamicVersionNeeds: missing version table")
+		}
+	}
+
+	return f.dynVerNeeds, nil
+}
+
+// gnuVersionInit parses the GNU version tables
+// for use by calls to gnuVersion.
+// It reports whether any version tables were found.
+func (f *File) gnuVersionInit(str []byte) (bool, error) {
 	// Versym parallels symbol table, indexing into verneed.
 	vs := f.SectionByType(SHT_GNU_VERSYM)
 	if vs == nil {
-		return false
+		return false, nil
 	}
-	d, _ = vs.Data()
+	d, _ := vs.Data()
 
-	f.gnuNeed = need
 	f.gnuVersym = d
-	return true
+	if err := f.dynamicVersions(str); err != nil {
+		return false, err
+	}
+	if err := f.dynamicVersionNeeds(str); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // gnuVersion adds Library and Version information to sym,
 // which came from offset i of the symbol table.
-func (f *File) gnuVersion(i int) (library string, version string) {
+func (f *File) gnuVersion(i int) (hasVersion bool, versionIndex VersionIndex, version string, library string) {
 	// Each entry is two bytes; skip undef entry at beginning.
 	i = (i + 1) * 2
 	if i >= len(f.gnuVersym) {
-		return
+		return false, 0, "", ""
 	}
 	s := f.gnuVersym[i:]
 	if len(s) < 2 {
-		return
+		return false, 0, "", ""
 	}
-	j := int(f.ByteOrder.Uint16(s))
-	if j < 2 || j >= len(f.gnuNeed) {
-		return
+	vi := VersionIndex(f.ByteOrder.Uint16(s))
+	ndx := vi.Index()
+
+	if ndx == 0 || ndx == 1 {
+		return true, vi, "", ""
 	}
-	n := &f.gnuNeed[j]
-	return n.File, n.Name
+
+	for _, v := range f.dynVerNeeds {
+		for _, n := range v.Needs {
+			if ndx == n.Index {
+				return true, vi, n.Dep, v.Name
+			}
+		}
+	}
+
+	for _, v := range f.dynVers {
+		if ndx == v.Index {
+			return true, vi, v.Name, ""
+		}
+	}
+
+	return false, 0, "", ""
 }
 
 // ImportedLibraries returns the names of all libraries
@@ -1689,4 +1821,39 @@ type nobitsSectionReader struct{}
 
 func (*nobitsSectionReader) ReadAt(p []byte, off int64) (n int, err error) {
 	return 0, errors.New("unexpected read from SHT_NOBITS section")
+}
+
+// putUint writes a relocation to slice
+// at offset start of length length (4 or 8 bytes),
+// adding sym+addend to the existing value if readUint is true,
+// or just writing sym+addend if readUint is false.
+// If the write would extend beyond the end of slice, putUint does nothing.
+// If the addend is negative, putUint does nothing.
+// If the addition would overflow, putUint does nothing.
+func putUint(byteOrder binary.ByteOrder, slice []byte, start, length, sym uint64, addend int64, readUint bool) {
+	if start+length > uint64(len(slice)) || math.MaxUint64-start < length {
+		return
+	}
+	if addend < 0 {
+		return
+	}
+
+	s := slice[start : start+length]
+
+	switch length {
+	case 4:
+		ae := uint32(addend)
+		if readUint {
+			ae += byteOrder.Uint32(s)
+		}
+		byteOrder.PutUint32(s, uint32(sym)+ae)
+	case 8:
+		ae := uint64(addend)
+		if readUint {
+			ae += byteOrder.Uint64(s)
+		}
+		byteOrder.PutUint64(s, sym+ae)
+	default:
+		panic("can't happen")
+	}
 }
